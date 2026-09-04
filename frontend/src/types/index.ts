@@ -104,6 +104,7 @@ export interface Conversation {
   external_user_id: string | null;
   external_user_name: string | null;
   status: ConversationStatus;
+  assigned_to_human: boolean;
   last_message_at: string | null;
   created_at: string;
 }
