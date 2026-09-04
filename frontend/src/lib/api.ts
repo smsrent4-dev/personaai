@@ -1,11 +1,19 @@
-import axios, { AxiosError, type InternalAxiosRequestConfig } from "axios";
+import axios, {
+  AxiosError,
+  type InternalAxiosRequestConfig,
+} from "axios";
 import { useAuthStore } from "./auth-store";
-
+// In local development, Vite proxies /api to localhost:8000.
+// In production, VITE_API_URL points directly to the deployed backend.
+const API_BASE_URL = import.meta.env.VITE_API_URL
+  ? `${import.meta.env.VITE_API_URL}/api/v1`
+  : "/api/v1";
 export const api = axios.create({
-  baseURL: "/api/v1",
-  headers: { "Content-Type": "application/json" },
+  baseURL: API_BASE_URL,
+  headers: {
+    "Content-Type": "application/json",
+  },
 });
-
 api.interceptors.request.use((config) => {
   const token = useAuthStore.getState().accessToken;
   if (token) {
@@ -13,9 +21,7 @@ api.interceptors.request.use((config) => {
   }
   return config;
 });
-
 let refreshInFlight: Promise<string> | null = null;
-
 async function refreshAccessToken(): Promise<string> {
   const { refreshToken, setTokens, logout } = useAuthStore.getState();
   if (!refreshToken) {
@@ -23,7 +29,12 @@ async function refreshAccessToken(): Promise<string> {
     throw new Error("No refresh token available");
   }
   try {
-    const { data } = await axios.post("/api/v1/auth/refresh", { refresh_token: refreshToken });
+    const { data } = await axios.post(
+      `${API_BASE_URL}/auth/refresh`,
+      {
+        refresh_token: refreshToken,
+      }
+    );
     setTokens(data.access_token, data.refresh_token);
     return data.access_token;
   } catch (err) {
@@ -31,19 +42,27 @@ async function refreshAccessToken(): Promise<string> {
     throw err;
   }
 }
-
 api.interceptors.response.use(
   (response) => response,
   async (error: AxiosError) => {
-    const original = error.config as InternalAxiosRequestConfig & { _retried?: boolean };
-    if (error.response?.status === 401 && original && !original._retried && !original.url?.includes("/auth/")) {
+    const original = error.config as
+      | (InternalAxiosRequestConfig & { _retried?: boolean })
+      | undefined;
+    if (
+      error.response?.status === 401 &&
+      original &&
+      !original._retried &&
+      !original.url?.includes("/auth/")
+    ) {
       original._retried = true;
       try {
         refreshInFlight = refreshInFlight ?? refreshAccessToken();
         const newToken = await refreshInFlight;
         refreshInFlight = null;
         original.headers = original.headers ?? {};
-        (original.headers as Record<string, string>).Authorization = `Bearer ${newToken}`;
+        (
+          original.headers as Record<string, string>
+        ).Authorization = `Bearer ${newToken}`;
         return api(original);
       } catch {
         refreshInFlight = null;
@@ -53,12 +72,20 @@ api.interceptors.response.use(
     return Promise.reject(error);
   }
 );
-
-export function apiErrorMessage(err: unknown, fallback = "Something went wrong"): string {
+export function apiErrorMessage(
+  err: unknown,
+  fallback = "Something went wrong"
+): string {
   if (axios.isAxiosError(err)) {
-    const detail = (err.response?.data as { detail?: unknown } | undefined)?.detail;
-    if (typeof detail === "string") return detail;
-    if (Array.isArray(detail) && detail[0]?.msg) return String(detail[0].msg);
+    const detail = (
+      err.response?.data as { detail?: unknown } | undefined
+    )?.detail;
+    if (typeof detail === "string") {
+      return detail;
+    }
+    if (Array.isArray(detail) && detail[0]?.msg) {
+      return String(detail[0].msg);
+    }
   }
   return fallback;
 }
