@@ -1,0 +1,109 @@
+# Production deployment — standalone file, NOT a merge-overlay on top
+# of docker-compose.yml. (An earlier draft of this file tried to be an
+# overlay that overrode/cleared a few fields from the base file, e.g.
+# `ports: []` to drop the dev host-port mapping — but Docker Compose
+# merges list-type fields like `ports` by CONCATENATING them across
+# files, not replacing them, so that override would have silently kept
+# the base file's "8000:8000" mapping instead of removing it. Rather
+# than ship something that depends on getting Compose's merge-tag
+# syntax exactly right for a Compose version I can't verify against in
+# this sandbox, this is a complete, standalone definition instead —
+# more verbose, but nothing here depends on merge semantics.)
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml up -d --scale backend=3 --scale celery_worker=2
+#
+# Connection-pool sizing warning: each backend replica runs
+# WEB_CONCURRENCY worker PROCESSES (default 4, see backend/Dockerfile),
+# and each of those opens its own DB pool (pool_size=10 + max_overflow=20,
+# see backend/app/database.py) — so `--scale backend=3` alone means up
+# to 3 * 4 * 30 = 360 possible concurrent DB connections, almost
+# certainly more than Postgres's default max_connections=100. Before
+# scaling up for real traffic, raise Postgres's max_connections and/or
+# lower WEB_CONCURRENCY and/or lower pool_size so the numbers actually
+# multiply out to something your Postgres instance can hold open.
+#
+# NOT run end-to-end in the sandbox this was written in (no Docker
+# daemon available there) — validate the scaled stack actually comes
+# up and nginx distributes load across replicas before relying on this
+# in production (e.g. temporarily log each container's hostname per
+# request and confirm it rotates under load).
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-personaai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-personaai}
+      POSTGRES_DB: ${POSTGRES_DB:-personaai}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-personaai}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Runs migrations once per replica start, then the Dockerfile's
+    # gunicorn CMD. Running `alembic upgrade head` from every replica on
+    # every restart is redundant but harmless — Alembic's own
+    # bookkeeping (the alembic_version table) makes re-running upgrades
+    # a no-op once already applied. For a real deploy pipeline you'd
+    # more likely run migrations as a separate one-off step before
+    # rolling replicas out, not on every container start; left as the
+    # simpler self-contained version here.
+    command: sh -c "alembic upgrade head && gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w ${WEB_CONCURRENCY:-4} -b 0.0.0.0:8000 --access-logfile - --error-logfile -"
+    volumes:
+      - knowledge_storage:/app/storage
+    # No host port mapping — nginx is the one public entrypoint below.
+    # Multiple replicas can't all bind the same host port anyway.
+
+  celery_worker:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info"]
+    volumes:
+      - knowledge_storage:/app/storage
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "8000:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+
+volumes:
+  postgres_data:
+  knowledge_storage:

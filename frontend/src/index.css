@@ -1,0 +1,83 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-base-border;
+  }
+  body {
+    background: #0B0C1E;
+    color: #F4F4F8;
+    min-height: 100vh;
+  }
+  ::selection {
+    background: rgba(139, 92, 246, 0.35);
+  }
+  :focus-visible {
+    outline: 2px solid #8B5CF6;
+    outline-offset: 2px;
+  }
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #2A2C4E;
+    border-radius: 999px;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply bg-base-panel border border-base-border rounded-2xl shadow-card;
+  }
+
+  .panel-glow {
+    box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.15), 0 20px 60px -30px rgba(139, 92, 246, 0.55);
+  }
+
+  .stat-value {
+    @apply font-display text-2xl font-semibold text-ink tabular-nums;
+  }
+
+  .nav-link {
+    @apply flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm text-nav-text transition-colors;
+  }
+  .nav-link:hover {
+    @apply bg-white/5 text-white;
+  }
+  .nav-link[data-active="true"] {
+    @apply bg-accent-violet text-white;
+  }
+
+  .status-dot {
+    @apply inline-block h-1.5 w-1.5 rounded-full;
+  }
+}
+
+@layer utilities {
+  .text-glow-violet {
+    text-shadow: 0 0 24px rgba(139, 92, 246, 0.45);
+  }
+}
+
+.orbit-line {
+  stroke: url(#orbit-line-gradient);
+  stroke-width: 1.5;
+  fill: none;
+  stroke-dasharray: 4 6;
+  animation: flow-dash 3s linear infinite;
+  opacity: 0.5;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .orbit-line,
+  .animate-pulse-slow,
+  .animate-orbit-spin {
+    animation: none !important;
+  }
+}
