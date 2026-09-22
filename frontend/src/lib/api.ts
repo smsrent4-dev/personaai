@@ -3,10 +3,25 @@ import axios, {
   type InternalAxiosRequestConfig,
 } from "axios";
 import { useAuthStore } from "./auth-store";
-// In local development, Vite proxies /api to localhost:8000.
-// In production, VITE_API_URL points directly to the deployed backend.
-const API_BASE_URL = import.meta.env.VITE_API_URL
-  ? `${import.meta.env.VITE_API_URL}/api/v1`
+/**
+ * API configuration
+ *
+ * Local:
+ *   Vite proxies /api → http://localhost:8000
+ *
+ * Production:
+ *   VITE_API_URL should contain ONLY the backend origin, for example:
+ *   https://your-backend.up.railway.app
+ *
+ * /api/v1 is added here automatically.
+ */
+// Remove trailing slashes so we never produce:
+// https://backend.com//api/v1
+const configuredApiUrl = (
+  import.meta.env.VITE_API_URL as string | undefined
+)?.replace(/\/+$/, "");
+const API_BASE_URL = configuredApiUrl
+  ? `${configuredApiUrl}/api/v1`
   : "/api/v1";
 export const api = axios.create({
   baseURL: API_BASE_URL,
