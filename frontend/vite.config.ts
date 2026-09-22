@@ -1,7 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "path";
-
 export default defineConfig({
   plugins: [react()],
   resolve: {
@@ -17,5 +16,12 @@ export default defineConfig({
         changeOrigin: true,
       },
     },
+  },
+  preview: {
+    host: "0.0.0.0",
+    port: 4173,
+    allowedHosts: [
+      "practical-sparkle-production-9cb5.up.railway.app",
+    ],
   },
 });
