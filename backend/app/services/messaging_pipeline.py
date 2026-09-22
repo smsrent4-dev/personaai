@@ -1,34 +1,36 @@
-"""MessagingPipeline — orchestrates incoming platform messages end-to-end.
+"""MessagingPipeline — the piece that actually strings together every
+previous milestone: an incoming platform message becomes a routed,
+context-aware, generated reply, sent back through the same platform.
 
 Flow for handle_incoming():
+  1. adapter.parse_incoming(payload)              -> normalized IncomingMessage
+  2. ConversationService.get_or_create_conversation -> thread identity
+  3. store the incoming message
+  4. IMAGE/VOICE only: download the media and actually look at/listen
+     to it (_handle_image_message / _transcribe_voice) -> real content
+     instead of a canned "thanks, I got that" acknowledgement. A photo
+     that reads as a payment screenshot and matches a customer's order
+     still awaiting payment gets auto-attached via OrderService — see
+     _handle_image_message's docstring for why that stops short of
+     auto-confirming payment.
+  5. RouterService.route()                         -> which agent answers (Milestone 3)
+  6. KnowledgeService.search() + MemoryService.search() -> RAG context (Milestone 4)
+  7. build a prompt from agent instructions + context + recent history
+  8. AIProvider.generate()                         -> the reply text (Milestone 2)
+  9. store the outgoing message
+  10. adapter.send_text()                          -> actually deliver it
 
-    1. Parse platform payload into IncomingMessage.
-    2. Resolve/create the conversation.
-    3. Persist the inbound message.
-    4. Handle media:
-       - IMAGE -> download, vision analysis, optional receipt detection.
-       - VOICE -> download and transcription.
-    5. Route the message to the appropriate agent.
-    6. Retrieve knowledge, memory, and product context.
-    7. Generate the response through the AIProvider abstraction.
-    8. Persist the outbound message.
-    9. Optionally send a relevant product image.
-   10. Send the generated text through the platform adapter.
-
-This module is orchestration only. Provider-specific behavior belongs in
-AIProvider implementations such as GeminiProvider.
+Every step reuses a service built in an earlier milestone rather than
+reimplementing anything - this file is orchestration, not new logic.
 """
-
-from __future__ import annotations
-
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
-from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from fastapi import HTTPException, status
 
 from app.core.plan_limits import check_message_limit
 from app.models.agent import Agent, AgentStatus
@@ -49,176 +51,112 @@ from app.services.platforms.base import IncomingMessage
 from app.services.platforms.registry import build_adapter
 from app.services.product_service import ProductService
 from app.services.router_service import RouterService
-from app.services.tools import (
-    ToolContext,
-    default_tool_definitions,
-    execute_tool,
-)
+from app.services.tools import ToolContext, default_tool_definitions, execute_tool
 
 logger = logging.getLogger(__name__)
 
+# Order statuses/payment states we still consider "waiting on this
+# customer to pay" — a payment screenshot only auto-attaches to an
+# order in one of these states. An order already PAID, CANCELLED, or
+# REFUNDED is not a valid receipt target even if it's the customer's
+# most recent order.
+_AWAITING_PAYMENT_STATUSES = {PaymentStatus.UNPAID, PaymentStatus.AWAITING_CONFIRMATION}
+_CLOSED_ORDER_STATUSES = {OrderStatus.CANCELLED, OrderStatus.REFUNDED, OrderStatus.DELIVERED}
 
-_AWAITING_PAYMENT_STATUSES = {
-    PaymentStatus.UNPAID,
-    PaymentStatus.AWAITING_CONFIRMATION,
-}
-
-_CLOSED_ORDER_STATUSES = {
-    OrderStatus.CANCELLED,
-    OrderStatus.REFUNDED,
-    OrderStatus.DELIVERED,
-}
-
+# Cosine similarity floor before we consider a product match "on topic"
+# enough to send its photo unprompted. product_service.search() always
+# returns its top_k best-effort matches even for queries with no real
+# product relevance (e.g. "what are your hours") — this threshold is what
+# stops PersonaAI from sending a random product photo on every message.
 PRODUCT_PHOTO_MIN_SCORE = 0.5
-
-PAYMENT_RECEIPT_LABEL = "payment_receipt_or_bank_transfer_confirmation"
-NON_PAYMENT_IMAGE_LABEL = "something_else"
-
-IMAGE_ANALYSIS_FAILURE_REPLY = (
-    "I received your image, but I'm temporarily unable to analyze images "
-    "right now. Please try again shortly."
-)
-
-VOICE_TRANSCRIPTION_FAILURE_REPLY = (
-    "I received your voice message, but I'm temporarily unable to process "
-    "voice messages right now. Please try again shortly, or send your "
-    "message as text."
-)
-
-GENERAL_PROCESSING_FAILURE_REPLY = (
-    "Sorry, something went wrong while processing your message. "
-    "We'll follow up shortly."
-)
-
-_PAYMENT_RECEIPT_REPLY_TEMPLATE = (
-    "Thanks — we've received your payment screenshot for order #{order_id}. "
-    "We'll review and confirm it shortly."
-)
-
-_WEEKDAY_KEYS = [
-    "mon",
-    "tue",
-    "wed",
-    "thu",
-    "fri",
-    "sat",
-    "sun",
-]
 
 
 def _build_product_photo_caption(product: Product) -> str:
-    """Build a useful caption for a product image."""
+    """Name + price was the whole caption before — a customer asking
+    "do you have crocs?" got a photo with no idea what sizes/colors
+    (the product's `variants`, e.g. {"name": "Size 42, Red", ...}) are
+    actually available, or whether it's in stock at all. This is what
+    the fix for that actually sends."""
+    lines = [f"{product.name} — {product.price} {product.currency}"]
 
-    lines = [
-        f"{product.name} — {product.price} {product.currency}",
-    ]
-
-    variants = product.variants or []
-
-    variant_names = [
-        variant.get("name")
-        for variant in variants
-        if isinstance(variant, dict) and variant.get("name")
-    ]
-
+    variant_names = [v.get("name") for v in product.variants if v.get("name")]
     if variant_names:
         lines.append(f"Available: {', '.join(variant_names)}")
 
     if product.inventory is not None:
-        lines.append(
-            "In stock"
-            if product.inventory > 0
-            else "Currently out of stock"
-        )
+        lines.append("In stock" if product.inventory > 0 else "Currently out of stock")
 
     if product.description:
         lines.append(product.description[:200])
 
-    return "\n".join(lines)[:1024]
+    caption = "\n".join(lines)
+    return caption[:1024]  # Telegram/WhatsApp caption length caps; adapters also enforce this, belt-and-suspenders
 
 
 _NON_TEXT_ACKNOWLEDGEMENTS = {
-    MessageType.DOCUMENT: (
-        "Thanks for the document — I've received it and will follow up shortly."
-    ),
-    MessageType.LOCATION: "Thanks for sharing your location — noted.",
-    MessageType.VIDEO: (
-        "Thanks for the video — I've received it and will follow up shortly."
-    ),
-    MessageType.CONTACT: "Thanks for sharing that contact — noted.",
+    # IMAGE and VOICE are handled separately now — see
+    # _handle_image_message / _transcribe_voice — and only fall back to
+    # a canned acknowledgement here if analysis itself fails (download
+    # error, AI provider error, etc.), not as the normal path.
+    MessageType.IMAGE: "Thanks for the image - I've received it and will follow up shortly.",
+    MessageType.DOCUMENT: "Thanks for the document - I've received it and will follow up shortly.",
+    MessageType.VOICE: "Thanks for the voice message - I've received it and will follow up shortly.",
+    MessageType.LOCATION: "Thanks for sharing your location - noted.",
+    MessageType.VIDEO: "Thanks for the video - I've received it and will follow up shortly.",
+    MessageType.CONTACT: "Thanks for sharing that contact - noted.",
     MessageType.OTHER: "Got it, thanks!",
 }
 
+_WEEKDAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
-def _after_hours_reply(settings: dict[str, Any]) -> str | None:
-    """Return an after-hours response when business hours are configured.
 
-    Invalid business-hour configuration fails open and allows normal
-    message processing.
+def _after_hours_reply(settings: dict) -> str | None:
+    """Returns a canned after-hours reply if `settings["business_hours"]` is
+    configured, enabled, and the current time (in the configured timezone)
+    falls outside every window for today — otherwise None, meaning "proceed
+    with a normal AI-generated reply".
+
+    Deliberately simple: one open/close window per day, no holiday
+    calendar, no per-agent overrides. Format:
+        {"enabled": true, "timezone": "Africa/Lagos",
+         "hours": {"mon": ["09:00", "17:00"], ...}, "message": "..."}
+    A day omitted from `hours` (or an empty list) means closed all day.
+    Malformed configuration fails open (treated as "no restriction") rather
+    than silently blocking every message.
     """
-
     business_hours = settings.get("business_hours")
-
     if not business_hours or not business_hours.get("enabled"):
         return None
 
     try:
-        from datetime import datetime as _datetime
         import zoneinfo
+        from datetime import datetime as _dt
 
-        timezone_name = business_hours.get("timezone", "UTC")
-        timezone_info = zoneinfo.ZoneInfo(timezone_name)
-
-        now = _datetime.now(timezone_info)
-        weekday = _WEEKDAY_KEYS[now.weekday()]
-
-        window = business_hours.get("hours", {}).get(weekday)
-
+        tz = zoneinfo.ZoneInfo(business_hours.get("timezone", "UTC"))
+        now = _dt.now(tz)
+        today_key = _WEEKDAY_KEYS[now.weekday()]
+        window = business_hours.get("hours", {}).get(today_key)
         if not window:
             is_open = False
         else:
-            if not isinstance(window, (list, tuple)) or len(window) != 2:
-                raise ValueError("Business-hour window must contain open/close.")
-
-            open_str, close_str = window
-
-            open_time = _datetime.strptime(
-                open_str,
-                "%H:%M",
-            ).time()
-
-            close_time = _datetime.strptime(
-                close_str,
-                "%H:%M",
-            ).time()
-
+            open_str, close_str = window[0], window[1]
+            open_time = _dt.strptime(open_str, "%H:%M").time()
+            close_time = _dt.strptime(close_str, "%H:%M").time()
             is_open = open_time <= now.time() <= close_time
-
     except Exception:
-        logger.warning(
-            "Malformed business_hours configuration; failing open.",
-            exc_info=True,
-        )
+        logger.warning("Malformed business_hours settings; ignoring", exc_info=True)
         return None
 
     if is_open:
         return None
-
     return business_hours.get(
-        "message",
-        (
-            "Thanks for reaching out! We're currently outside business "
-            "hours and will reply as soon as we're back."
-        ),
+        "message", "Thanks for reaching out! We're currently outside business hours and will reply as soon as we're back."
     )
 
 
 class MessagingPipeline:
-    """Orchestrates platform messages through PersonaAI services."""
-
     def __init__(self, db: AsyncSession):
         self.db = db
-
         self.conversation_service = ConversationService(db)
         self.router_service = RouterService(db)
         self.knowledge_service = KnowledgeService(db)
@@ -228,169 +166,127 @@ class MessagingPipeline:
         self.order_service = OrderService(db)
 
     async def handle_incoming(
-        self,
-        owner: User,
-        integration: PlatformIntegration,
-        raw_payload: dict,
+        self, owner: User, integration: PlatformIntegration, raw_payload: dict
     ) -> None:
-        """Process one incoming platform payload.
-
-        All platform-specific transport behavior remains inside the adapter.
-        All model/provider-specific behavior remains behind AIProvider.
-        """
-
         adapter = build_adapter(integration)
-
         try:
             incoming = adapter.parse_incoming(raw_payload)
-
             if incoming is None:
                 return
 
-            conversation = (
-                await self.conversation_service.get_or_create_conversation(
-                    owner_id=owner.id,
-                    platform=integration.platform,
-                    external_conversation_id=incoming.external_conversation_id,
-                    external_user_id=incoming.external_user_id,
-                    external_user_name=incoming.external_user_name,
-                )
+            conversation = await self.conversation_service.get_or_create_conversation(
+                owner_id=owner.id,
+                platform=integration.platform,
+                external_conversation_id=incoming.external_conversation_id,
+                external_user_id=incoming.external_user_id,
+                external_user_name=incoming.external_user_name,
             )
 
-            inbound_message = (
-                await self.conversation_service.add_message(
-                    conversation,
-                    role=MessageRole.USER,
-                    content=incoming.text,
-                    message_type=incoming.message_type,
-                    external_message_id=incoming.external_message_id,
-                    media_file_id=incoming.media_file_id,
-                    latitude=incoming.latitude,
-                    longitude=incoming.longitude,
-                    platform_metadata=incoming.platform_metadata,
-                )
+            inbound_message = await self.conversation_service.add_message(
+                conversation,
+                role=MessageRole.USER,
+                content=incoming.text,
+                message_type=incoming.message_type,
+                external_message_id=incoming.external_message_id,
+                media_file_id=incoming.media_file_id,
+                latitude=incoming.latitude,
+                longitude=incoming.longitude,
+                platform_metadata=incoming.platform_metadata,
             )
-
             await self.db.commit()
 
-            await self._mark_message_read(
-                adapter=adapter,
-                incoming=incoming,
-                integration=integration,
-            )
+            if incoming.external_message_id and integration.settings.get("read_receipts", True):
+                try:
+                    await adapter.mark_read(
+                        incoming.external_message_id, show_typing=integration.settings.get("typing_indicator", True)
+                    )
+                except Exception:
+                    # Read receipts/typing indicators are a nicety, never worth failing the reply over.
+                    logger.debug("mark_read failed for message %s", incoming.external_message_id, exc_info=True)
 
-            customer = await self._resolve_customer(
-                owner=owner,
-                integration=integration,
-                incoming=incoming,
-            )
+            customer = None
+            if incoming.external_user_id:
+                customer = await self.customer_service.get_or_create_customer(
+                    owner_id=owner.id,
+                    platform=integration.platform,
+                    external_user_id=incoming.external_user_id,
+                    display_name=incoming.external_user_name,
+                )
+                await self.db.commit()
 
-            if conversation.assigned_to_human:
-                return
-
-            if not integration.settings.get("auto_reply", True):
+            if conversation.assigned_to_human or not integration.settings.get("auto_reply", True):
+                # A human is handling this thread, or the owner has switched
+                # auto-reply off for this integration — store the message and
+                # stop. No agent routing, no AI call, no auto-reply.
                 return
 
             after_hours_reply = _after_hours_reply(integration.settings)
-
             if after_hours_reply is not None:
-                await self._send_stored_reply(
-                    conversation=conversation,
-                    external_conversation_id=(
-                        incoming.external_conversation_id
-                    ),
-                    adapter=adapter,
-                    content=after_hours_reply,
-                    role=MessageRole.SYSTEM,
+                await self.conversation_service.add_message(
+                    conversation, role=MessageRole.SYSTEM, content=after_hours_reply
                 )
+                await self.db.commit()
+                await adapter.send_text(incoming.external_conversation_id, after_hours_reply)
                 return
 
-            limit_reached, plan = await check_message_limit(
-                self.db,
-                owner.id,
-            )
-
+            # Plan enforcement's one non-HTTP checkpoint: everything past this
+            # point costs a Gemini call (routing when there's more than one
+            # active agent, then the reply generation itself). A message that
+            # arrives over quota still gets stored above (that's just a DB
+            # write), but never reaches the AI — this is the fix for the
+            # "unlimited messages on a $0 plan" gap flagged in
+            # app/core/plan_limits.py's docstring.
+            limit_reached, plan = await check_message_limit(self.db, owner.id)
             if limit_reached:
-                await self._handle_message_limit_reached(
-                    owner=owner,
-                    integration=integration,
-                    conversation=conversation,
-                    adapter=adapter,
-                    plan=plan,
-                )
+                await self._handle_message_limit_reached(owner, integration, conversation, adapter, plan)
                 return
 
+            # effective_text is what actually drives routing + reply
+            # generation below. For a TEXT message it's just the text.
+            # For IMAGE/VOICE it starts as None and gets filled in by
+            # actually looking at/listening to the media — this is the
+            # fix for photos and voice notes being stored but never
+            # analyzed (previously every non-text message got a canned
+            # "thanks, I got that" no matter what it contained).
             effective_text = incoming.text
 
-            if (
-                incoming.message_type == MessageType.IMAGE
-                and incoming.media_file_id
-            ):
-                handled, effective_text = (
-                    await self._handle_image_message(
-                        owner=owner,
-                        conversation=conversation,
-                        customer=customer,
-                        incoming=incoming,
-                        adapter=adapter,
-                        inbound_message=inbound_message,
-                    )
+            if incoming.message_type == MessageType.IMAGE and incoming.media_file_id:
+                handled, effective_text = await self._handle_image_message(
+                    owner, conversation, customer, incoming, adapter, inbound_message
                 )
-
                 if handled:
                     return
-
-            elif (
-                incoming.message_type == MessageType.VOICE
-                and incoming.media_file_id
-            ):
-                effective_text = await self._transcribe_voice(
-                    incoming=incoming,
-                    adapter=adapter,
-                    inbound_message=inbound_message,
-                )
-
-                if not effective_text:
-                    await self._send_media_processing_failure(
-                        conversation=conversation,
-                        external_conversation_id=(
-                            incoming.external_conversation_id
-                        ),
-                        adapter=adapter,
-                        content=VOICE_TRANSCRIPTION_FAILURE_REPLY,
-                    )
-                    return
+            elif incoming.message_type == MessageType.VOICE and incoming.media_file_id:
+                effective_text = await self._transcribe_voice(incoming, adapter, inbound_message)
 
             try:
-                agent = await self._resolve_agent(
-                    owner=owner,
-                    conversation=conversation,
-                    integration=integration,
-                    effective_text=effective_text,
-                )
-
+                if effective_text:
+                    agent = await self.router_service.route(owner.id, effective_text)
+                else:
+                    agent = await self._pick_agent_without_ai(owner.id, conversation, integration)
                 reply_text, top_product = await self._build_reply(
-                    owner=owner,
-                    conversation=conversation,
-                    incoming=incoming,
-                    agent=agent,
-                    customer=customer,
-                    effective_text=effective_text,
+                    owner, conversation, incoming, agent, customer, effective_text
                 )
-
             except Exception:
+                # Previously uncaught — an AI failure anywhere in routing
+                # (Router.route() calls Gemini to classify which agent,
+                # when there's more than one active) or reply generation
+                # (missing/invalid GEMINI_API_KEY, quota exhausted, Gemini
+                # having an outage) propagated all the way out of
+                # handle_incoming with no fallback, so the customer got no
+                # reply at all and nothing indicated why. Every other
+                # failure point in this file (image analysis, message
+                # limits) already degrades to a sent reply instead of
+                # silence; this is that same treatment for the actual
+                # routing + reply-generation steps.
                 logger.error(
-                    (
-                        "Routing or reply generation failed for "
-                        "conversation %s"
-                    ),
-                    conversation.id,
-                    exc_info=True,
+                    "Routing or reply generation failed for conversation %s", conversation.id, exc_info=True
                 )
-
                 agent = None
-                reply_text = GENERAL_PROCESSING_FAILURE_REPLY
-                top_product = None
+                reply_text, top_product = (
+                    "Sorry, something went wrong on our end. We'll follow up shortly.",
+                    None,
+                )
 
             await self.conversation_service.add_message(
                 conversation,
@@ -398,109 +294,24 @@ class MessagingPipeline:
                 content=reply_text,
                 agent_id=agent.id if agent is not None else None,
             )
-
             await self.db.commit()
 
-            await self._send_product_photo(
-                adapter=adapter,
-                incoming=incoming,
-                product=top_product,
-            )
+            if top_product is not None and top_product.images:
+                try:
+                    caption = _build_product_photo_caption(top_product)
+                    await adapter.send_photo(incoming.external_conversation_id, top_product.images[0], caption)
+                except Exception:
+                    # A broken image URL shouldn't block the actual text reply.
+                    logger.warning(
+                        "Failed to send product photo for product %s", top_product.id, exc_info=True
+                    )
 
-            await adapter.send_text(
-                incoming.external_conversation_id,
-                reply_text,
-            )
-
-        except Exception:
-            logger.error(
-                (
-                    "Unhandled messaging pipeline failure for "
-                    "integration %s"
-                ),
-                integration.id,
-                exc_info=True,
-            )
+            await adapter.send_text(incoming.external_conversation_id, reply_text)
 
         finally:
             aclose = getattr(adapter, "aclose", None)
-
             if aclose is not None:
-                try:
-                    await aclose()
-                except Exception:
-                    logger.warning(
-                        "Failed to close platform adapter.",
-                        exc_info=True,
-                    )
-
-    async def _mark_message_read(
-        self,
-        adapter,
-        incoming: IncomingMessage,
-        integration: PlatformIntegration,
-    ) -> None:
-        """Mark an inbound message read and optionally show typing."""
-
-        if not incoming.external_message_id:
-            return
-
-        if not integration.settings.get("read_receipts", True):
-            return
-
-        try:
-            await adapter.mark_read(
-                incoming.external_message_id,
-                show_typing=integration.settings.get(
-                    "typing_indicator",
-                    True,
-                ),
-            )
-        except Exception:
-            logger.debug(
-                "Failed to mark message %s as read.",
-                incoming.external_message_id,
-                exc_info=True,
-            )
-
-    async def _resolve_customer(
-        self,
-        owner: User,
-        integration: PlatformIntegration,
-        incoming: IncomingMessage,
-    ):
-        """Resolve the PersonaAI customer associated with the sender."""
-
-        if not incoming.external_user_id:
-            return None
-
-        try:
-            customer = (
-                await self.customer_service.get_or_create_customer(
-                    owner_id=owner.id,
-                    platform=integration.platform,
-                    external_user_id=incoming.external_user_id,
-                    display_name=incoming.external_user_name,
-                )
-            )
-
-            await self.db.commit()
-            return customer
-
-        except Exception:
-            await self.db.rollback()
-
-            logger.error(
-                (
-                    "Failed to resolve customer for external user %s "
-                    "on integration %s"
-                ),
-                incoming.external_user_id,
-                integration.id,
-                exc_info=True,
-            )
-
-            return None
+                await aclose()
 
     async def _handle_message_limit_reached(
         self,
@@ -510,133 +321,56 @@ class MessagingPipeline:
         adapter,
         plan,
     ) -> None:
-        """Send a non-AI response after the monthly plan limit is reached."""
-
+        """The contact still gets a reply — just not an AI-generated one —
+        and the owner gets told once per day, not on every message while
+        they're over quota (that would just be a second way for a $0
+        account to spam their own notification feed)."""
         reply_text = (
-            "Thanks for your message! We've reached our messaging limit "
-            "for this month — a team member will get back to you as soon "
-            "as possible."
+            "Thanks for your message! We've reached our messaging limit for this month — "
+            "a team member will get back to you as soon as possible."
         )
+        await self.conversation_service.add_message(conversation, role=MessageRole.SYSTEM, content=reply_text)
+        await self.db.commit()
+        await adapter.send_text(conversation.external_conversation_id, reply_text)
 
-        await self._send_stored_reply(
-            conversation=conversation,
-            external_conversation_id=conversation.external_conversation_id,
-            adapter=adapter,
-            content=reply_text,
-            role=MessageRole.SYSTEM,
-        )
-
-        recent_cutoff = (
-            datetime.now(timezone.utc) - timedelta(hours=24)
-        )
-
-        result = await self.db.execute(
+        recent_cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        already_notified = await self.db.execute(
             select(Notification.id).where(
                 Notification.owner_id == owner.id,
                 Notification.type == NotificationType.PLAN_LIMIT_REACHED,
                 Notification.created_at >= recent_cutoff,
             )
         )
-
-        if result.scalar_one_or_none() is not None:
+        if already_notified.scalar_one_or_none() is not None:
             return
 
         plan_name = plan.name if plan is not None else "your plan"
-
-        if plan is not None:
-            body = (
-                f"{plan_name} allows "
-                f"{plan.max_messages_per_month} messages/month, "
-                "and you've reached the limit. New messages are receiving "
-                "a fallback reply until you upgrade or the month resets."
-            )
-        else:
-            body = "You've reached your plan's monthly message limit."
-
         await NotificationService(self.db).create(
             owner_id=owner.id,
             type_=NotificationType.PLAN_LIMIT_REACHED,
             title="Monthly message limit reached",
-            body=body,
-            context={
-                "integration_id": str(integration.id),
-            },
+            body=(
+                f"{plan_name} allows {plan.max_messages_per_month} messages/month, and you've hit it. "
+                f"New messages are getting a hold-tight reply instead of an AI response until you "
+                f"upgrade or the month resets."
+                if plan is not None
+                else "You've reached your plan's monthly message limit."
+            ),
+            context={"integration_id": str(integration.id)},
         )
-
         await self.db.commit()
 
-    async def _send_stored_reply(
-        self,
-        conversation: Conversation,
-        external_conversation_id: str,
-        adapter,
-        content: str,
-        role: MessageRole,
-    ) -> None:
-        """Persist a reply before delivering it through the platform."""
-
-        await self.conversation_service.add_message(
-            conversation,
-            role=role,
-            content=content,
-        )
-
-        await self.db.commit()
-
-        try:
-            await adapter.send_text(
-                external_conversation_id,
-                content,
-            )
-        except Exception:
-            logger.error(
-                (
-                    "Failed to deliver stored reply for conversation %s"
-                ),
-                conversation.id,
-                exc_info=True,
-            )
-
-    async def _send_media_processing_failure(
-        self,
-        conversation: Conversation,
-        external_conversation_id: str,
-        adapter,
-        content: str,
-    ) -> None:
-        """Persist and deliver a media-processing failure response."""
-
-        await self._send_stored_reply(
-            conversation=conversation,
-            external_conversation_id=external_conversation_id,
-            adapter=adapter,
-            content=content,
-            role=MessageRole.AGENT,
-        )
-
-    async def _find_receipt_target_order(
-        self,
-        owner_id: uuid.UUID,
-        customer_id: uuid.UUID,
-    ) -> Order | None:
-        """Find the newest order still awaiting customer payment.
-
-        Never attaches a receipt to an order that is already paid, cancelled,
-        refunded, or delivered.
-        """
-
-        orders = await self.order_service.list_orders(
-            owner_id,
-            customer_id=customer_id,
-        )
-
-        for order in orders:
+    async def _find_receipt_target_order(self, owner_id: uuid.UUID, customer_id: uuid.UUID) -> Order | None:
+        """The most recent order for this customer that's genuinely
+        still waiting on payment. A payment screenshot only auto-attaches
+        if one exists — if the customer's most recent order is already
+        PAID (or there's no order at all), we don't guess."""
+        orders = await self.order_service.list_orders(owner_id, customer_id=customer_id)
+        for order in orders:  # already sorted newest-first
             if order.status in _CLOSED_ORDER_STATUSES:
                 continue
-
             if order.payment_status in _AWAITING_PAYMENT_STATUSES:
                 return order
-
         return None
 
     async def _handle_image_message(
@@ -648,363 +382,137 @@ class MessagingPipeline:
         adapter,
         inbound_message: Message,
     ) -> tuple[bool, str | None]:
-        """Analyze an incoming image and optionally attach a payment receipt.
+        """Actually looks at an incoming photo instead of just
+        acknowledging it. Returns (handled, effective_text):
 
-        Returns:
-            (True, None)
-                A response has already been sent and normal generation should
-                stop.
+          - handled=True: a reply was already sent from inside this
+            method (the payment-receipt path, or a failure fallback) —
+            handle_incoming should return immediately.
+          - handled=False: the image wasn't a receipt (or there's no
+            order to attach it to). effective_text describes what the
+            photo actually shows, which the caller feeds into the
+            normal routing + RAG + reply-generation flow, same as if
+            the customer had typed it — this is what makes "does this
+            look like the one in the picture?" answerable at all.
 
-            (False, enriched_text)
-                Image analysis succeeded and the enriched text should continue
-                through normal routing, RAG, product search, and generation.
-
-        Payment handling is deliberately conservative:
-
-            image
-              -> vision description
-              -> receipt classification
-              -> attach receipt
-              -> owner reviews
-              -> owner manually confirms payment
-
-        The pipeline never marks an order as PAID based solely on AI vision.
+        A download or AI-provider failure degrades to the canned IMAGE
+        acknowledgement (handled=True) rather than leaving the customer
+        without any reply — vision analysis is an enhancement, not a
+        new single point of failure for the whole pipeline.
         """
-
-        if not incoming.media_file_id:
-            return False, incoming.text
-
         try:
-            image_bytes, mime_type = await adapter.download_media(
-                incoming.media_file_id
-            )
-
-            if not image_bytes:
-                raise ValueError("Platform returned an empty image payload.")
-
-            description = (
-                await self.router_service.ai_provider.describe_image(
-                    image_bytes,
-                    mime_type,
-                )
-            )
-
-            description = (description or "").strip()
-
-            if not description:
-                raise ValueError(
-                    "Gemini returned an empty image description."
-                )
-
+            image_bytes, mime_type = await adapter.download_media(incoming.media_file_id)
+            description = await self.router_service.ai_provider.describe_image(image_bytes, mime_type)
         except Exception:
             logger.warning(
-                (
-                    "Image analysis failed for message %s in "
-                    "conversation %s"
-                ),
+                "Image analysis failed for message %s in conversation %s",
                 incoming.external_message_id,
                 conversation.id,
                 exc_info=True,
             )
-
-            await self._send_media_processing_failure(
-                conversation=conversation,
-                external_conversation_id=(
-                    incoming.external_conversation_id
-                ),
-                adapter=adapter,
-                content=IMAGE_ANALYSIS_FAILURE_REPLY,
-            )
-
-            return True, None
-
-        caption_note = ""
-
-        if incoming.text and incoming.text.strip():
-            caption_note = (
-                f' Customer caption: "{incoming.text.strip()}"'
-            )
-
-        enriched_text = (
-            "[Customer sent a photo."
-            f"{caption_note} "
-            f"What the photo shows: {description}]"
-        )
-
-        try:
-            await self.conversation_service.update_message_content(
-                inbound_message,
-                enriched_text,
-            )
+            fallback = _NON_TEXT_ACKNOWLEDGEMENTS[MessageType.IMAGE]
+            await self.conversation_service.add_message(conversation, role=MessageRole.AGENT, content=fallback)
             await self.db.commit()
-        except Exception:
-            await self.db.rollback()
-
-            logger.error(
-                (
-                    "Failed to persist analyzed image content for "
-                    "message %s"
-                ),
-                incoming.external_message_id,
-                exc_info=True,
-            )
-
-        if customer is None:
-            return False, enriched_text
-
-        target_order = await self._find_receipt_target_order(
-            owner.id,
-            customer.id,
-        )
-
-        if target_order is None:
-            return False, enriched_text
-
-        classification = await self._classify_payment_receipt(
-            description
-        )
-
-        if classification != PAYMENT_RECEIPT_LABEL:
-            return False, enriched_text
-
-        try:
-            await self.order_service.attach_receipt(
-                owner.id,
-                target_order.id,
-                incoming.media_file_id,
-            )
-
-            reply_text = _PAYMENT_RECEIPT_REPLY_TEMPLATE.format(
-                order_id=str(target_order.id)[:8].upper(),
-            )
-
-            await self.conversation_service.add_message(
-                conversation,
-                role=MessageRole.AGENT,
-                content=reply_text,
-            )
-
-            await self.db.commit()
-
-            try:
-                await adapter.send_text(
-                    incoming.external_conversation_id,
-                    reply_text,
-                )
-            except Exception:
-                logger.error(
-                    (
-                        "Payment receipt was attached to order %s but "
-                        "customer notification failed."
-                    ),
-                    target_order.id,
-                    exc_info=True,
-                )
-
+            await adapter.send_text(incoming.external_conversation_id, fallback)
             return True, None
 
-        except Exception:
-            await self.db.rollback()
+        caption_note = f' Caption: "{incoming.text.strip()}"' if incoming.text and incoming.text.strip() else ""
+        enriched_text = f"[Customer sent a photo.{caption_note} What the photo shows: {description}]"
+        await self.conversation_service.update_message_content(inbound_message, enriched_text)
+        await self.db.commit()
 
-            logger.error(
-                (
-                    "Failed to attach payment receipt for order %s "
-                    "from message %s"
-                ),
-                target_order.id,
-                incoming.external_message_id,
-                exc_info=True,
-            )
+        if customer is not None:
+            target_order = await self._find_receipt_target_order(owner.id, customer.id)
+            if target_order is not None:
+                try:
+                    classification = await self.router_service.ai_provider.classify(
+                        description, labels=["payment_receipt_or_bank_transfer_confirmation", "something_else"]
+                    )
+                except Exception:
+                    # Ambiguous vision result — treat conservatively as
+                    # "not a receipt" rather than risking a wrong auto-attach.
+                    classification = "something_else"
 
-            fallback = (
-                "I received your image, but I couldn't attach it to the "
-                "pending order automatically. Please send the receipt "
-                "again or contact the team so we can review it."
-            )
+                if classification == "payment_receipt_or_bank_transfer_confirmation":
+                    # attach_receipt only sets payment_status to
+                    # AWAITING_CONFIRMATION and notifies the owner — it does
+                    # NOT mark the order paid. The owner still reviews and
+                    # confirms manually (OrderService.confirm_payment),
+                    # exactly as if the receipt had been forwarded to them
+                    # directly. Auto-confirming payment from a vision guess
+                    # would be a real money mistake waiting to happen; this
+                    # automation only removes the "customer's photo silently
+                    # goes nowhere" failure mode, not the human review step.
+                    await self.order_service.attach_receipt(owner.id, target_order.id, incoming.media_file_id)
+                    reply_text = (
+                        f"Thanks — we've received your payment screenshot for order "
+                        f"#{str(target_order.id)[:8].upper()}. We'll review and confirm it shortly."
+                    )
+                    await self.conversation_service.add_message(
+                        conversation, role=MessageRole.AGENT, content=reply_text
+                    )
+                    await self.db.commit()
+                    await adapter.send_text(incoming.external_conversation_id, reply_text)
+                    return True, None
 
-            await self._send_media_processing_failure(
-                conversation=conversation,
-                external_conversation_id=(
-                    incoming.external_conversation_id
-                ),
-                adapter=adapter,
-                content=fallback,
-            )
-
-            return True, None
-
-    async def _classify_payment_receipt(
-        self,
-        image_description: str,
-    ) -> str | None:
-        """Classify an analyzed image as a payment receipt or not.
-
-        Failure is intentionally treated as non-receipt. This prevents a
-        provider outage or malformed response from causing an image to be
-        attached as a financial document by accident.
-        """
-
-        try:
-            classification = (
-                await self.router_service.ai_provider.classify(
-                    image_description,
-                    labels=[
-                        PAYMENT_RECEIPT_LABEL,
-                        NON_PAYMENT_IMAGE_LABEL,
-                    ],
-                )
-            )
-
-            classification = (classification or "").strip().lower()
-
-            if classification == PAYMENT_RECEIPT_LABEL:
-                return PAYMENT_RECEIPT_LABEL
-
-            return NON_PAYMENT_IMAGE_LABEL
-
-        except Exception:
-            logger.warning(
-                "Payment receipt classification failed.",
-                exc_info=True,
-            )
-
-            return NON_PAYMENT_IMAGE_LABEL
+        return False, enriched_text
 
     async def _transcribe_voice(
-        self,
-        incoming: IncomingMessage,
-        adapter,
-        inbound_message: Message,
+        self, incoming: IncomingMessage, adapter, inbound_message: Message
     ) -> str | None:
-        """Download and transcribe a voice message.
-
-        Returns the transcript when successful. A provider or download
-        failure returns None and is handled by handle_incoming().
-        """
-
-        if not incoming.media_file_id:
-            return None
-
+        """Downloads and transcribes a voice note. Returns the
+        transcript (feeding it into the normal reply flow, same as
+        _handle_image_message's effective_text), or None if download/
+        transcription failed or came back empty — the caller falls
+        back to the canned VOICE acknowledgement in that case."""
         try:
-            audio_bytes, mime_type = await adapter.download_media(
-                incoming.media_file_id
-            )
-
-            if not audio_bytes:
-                raise ValueError(
-                    "Platform returned an empty audio payload."
-                )
-
-            transcript = (
-                await self.router_service.ai_provider.transcribe_audio(
-                    audio_bytes,
-                    mime_type,
-                )
-            )
-
-            transcript = (transcript or "").strip()
-
-            if not transcript:
-                raise ValueError(
-                    "AI provider returned an empty voice transcript."
-                )
-
+            audio_bytes, mime_type = await adapter.download_media(incoming.media_file_id)
+            transcript = await self.router_service.ai_provider.transcribe_audio(audio_bytes, mime_type)
         except Exception:
             logger.warning(
-                "Voice transcription failed for message %s",
-                incoming.external_message_id,
-                exc_info=True,
+                "Voice transcription failed for message %s", incoming.external_message_id, exc_info=True
             )
             return None
 
-        try:
-            await self.conversation_service.update_message_content(
-                inbound_message,
-                f"[Voice message transcript] {transcript}",
-            )
+        transcript = (transcript or "").strip()
+        if not transcript:
+            return None
 
-            await self.db.commit()
-
-        except Exception:
-            await self.db.rollback()
-
-            logger.error(
-                (
-                    "Failed to persist voice transcript for message %s"
-                ),
-                incoming.external_message_id,
-                exc_info=True,
-            )
-
+        await self.conversation_service.update_message_content(
+            inbound_message, f"[Voice message transcript] {transcript}"
+        )
+        await self.db.commit()
         return transcript
 
-    async def _resolve_agent(
-        self,
-        owner: User,
-        conversation: Conversation,
-        integration: PlatformIntegration,
-        effective_text: str | None,
-    ) -> Agent:
-        """Resolve the agent responsible for the current message."""
-
-        if effective_text:
-            return await self.router_service.route(
-                owner.id,
-                effective_text,
-            )
-
-        return await self._pick_agent_without_ai(
-            owner.id,
-            conversation,
-            integration,
-        )
-
-    async def _pick_agent_without_ai(
-        self,
-        owner_id: uuid.UUID,
-        conversation: Conversation,
-        integration: PlatformIntegration,
-    ) -> Agent:
-        """Select an agent without invoking the AI router."""
-
+    async def _pick_agent_without_ai(self, owner_id: uuid.UUID, conversation: Conversation, integration: PlatformIntegration) -> Agent:
+        """For non-text messages we skip Router's classify() call entirely —
+        there's no message text to classify, and the acknowledgement reply
+        doesn't need agent-specific instructions anyway. Prefers whichever
+        agent is already handling this conversation, then an integration's
+        configured default agent, then falls back to the first active agent."""
         if conversation.agent_id is not None:
             try:
-                return await self.router_service.agent_service.get_agent(
-                    owner_id,
-                    conversation.agent_id,
-                )
+                return await self.router_service.agent_service.get_agent(owner_id, conversation.agent_id)
             except HTTPException:
-                pass
+                pass  # agent was deleted since — fall through to picking a fresh one
 
-        default_agent_id = integration.settings.get(
-            "default_agent_id"
-        )
-
+        default_agent_id = integration.settings.get("default_agent_id")
         if default_agent_id:
             try:
-                return await self.router_service.agent_service.get_agent(
-                    owner_id,
-                    uuid.UUID(str(default_agent_id)),
-                )
+                return await self.router_service.agent_service.get_agent(owner_id, uuid.UUID(default_agent_id))
             except (HTTPException, ValueError):
-                pass
+                pass  # configured default agent is gone/invalid — fall through
 
         active_agents = [
             agent
-            for agent in await self.router_service.agent_service.list_agents(
-                owner_id
-            )
+            for agent in await self.router_service.agent_service.list_agents(owner_id)
             if agent.status == AgentStatus.ACTIVE
         ]
-
         if not active_agents:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    "This account has no active agents to handle messages."
-                ),
+                detail="This account has no active agents to handle messages.",
             )
-
         return active_agents[0]
 
     async def _build_reply(
@@ -1012,226 +520,94 @@ class MessagingPipeline:
         owner: User,
         conversation: Conversation,
         incoming: IncomingMessage,
-        agent: Agent,
+        agent,
         customer,
         effective_text: str | None,
     ) -> tuple[str, Product | None]:
-        """Build the AI response using RAG, memory, products, and tools."""
-
         if not effective_text:
-            return (
-                _NON_TEXT_ACKNOWLEDGEMENTS.get(
-                    incoming.message_type,
-                    "Got it, thanks!",
-                ),
-                None,
-            )
+            return _NON_TEXT_ACKNOWLEDGEMENTS.get(incoming.message_type, "Got it, thanks!"), None
 
         knowledge_results = await self.knowledge_service.search(
-            owner.id,
-            effective_text,
-            agent_id=agent.id,
-            top_k=3,
+            owner.id, effective_text, agent_id=agent.id, top_k=3
         )
-
         memory_results = await self.memory_service.search(
-            owner.id,
-            effective_text,
-            agent_id=agent.id,
-            top_k=3,
+            owner.id, effective_text, agent_id=agent.id, top_k=3
         )
-
-        product_results = await self.product_service.search(
-            owner.id,
-            effective_text,
-            top_k=3,
-        )
-
-        history = await self.conversation_service.get_recent_messages(
-            conversation.id,
-            limit=10,
-        )
+        product_results = await self.product_service.search(owner.id, effective_text, top_k=3)
+        history = await self.conversation_service.get_recent_messages(conversation.id, limit=10)
 
         system_instruction = self._build_system_instruction(
-            agent=agent,
-            knowledge_results=knowledge_results,
-            memory_results=memory_results,
-            product_results=product_results,
+            agent, knowledge_results, memory_results, product_results
         )
-
-        prompt = self._build_prompt(
-            history=history,
-            latest_text=effective_text,
-        )
+        prompt = self._build_prompt(history, effective_text)
 
         if customer is not None:
+            # Real tool-calling: the AI itself decides whether this message
+            # needs search_product/create_order, or just a plain reply — see
+            # AIProvider.generate_with_tools's docstring for why this is a
+            # concrete (not abstract) method and what falls back to plain
+            # generate() when a provider doesn't implement real tool-calling.
             context = ToolContext(
-                db=self.db,
-                owner_id=owner.id,
-                customer=customer,
-                conversation_id=conversation.id,
+                db=self.db, owner_id=owner.id, customer=customer, conversation_id=conversation.id
             )
 
-            async def tool_executor(
-                tool_name: str,
-                arguments: dict,
-            ) -> dict:
-                return await execute_tool(
-                    tool_name,
-                    arguments,
-                    context,
-                )
+            async def tool_executor(tool_name: str, arguments: dict) -> dict:
+                return await execute_tool(tool_name, arguments, context)
 
-            reply_text = (
-                await self.router_service.ai_provider.generate_with_tools(
-                    prompt,
-                    tools=default_tool_definitions(),
-                    tool_executor=tool_executor,
-                    system_instruction=system_instruction,
-                    temperature=agent.temperature,
-                )
-            )
-
-        else:
-            reply_text = await self.router_service.ai_provider.generate(
+            reply_text = await self.router_service.ai_provider.generate_with_tools(
                 prompt,
+                tools=default_tool_definitions(),
+                tool_executor=tool_executor,
                 system_instruction=system_instruction,
                 temperature=agent.temperature,
             )
-
-        reply_text = (reply_text or "").strip()
-
-        if not reply_text:
-            raise RuntimeError(
-                "AI provider returned an empty reply."
+        else:
+            # No resolvable customer identity (e.g. adapter didn't supply a
+            # sender id) — tools that create orders need a Customer to
+            # attach the order to, so we skip tool-calling and just reply.
+            reply_text = await self.router_service.ai_provider.generate(
+                prompt, system_instruction=system_instruction, temperature=agent.temperature
             )
 
         top_product = None
-
         if product_results:
             best_product, best_score = product_results[0]
-
             if best_score >= PRODUCT_PHOTO_MIN_SCORE:
                 top_product = best_product
 
         return reply_text, top_product
 
-    async def _send_product_photo(
-        self,
-        adapter,
-        incoming: IncomingMessage,
-        product: Product | None,
-    ) -> None:
-        """Send a relevant product image without blocking the text reply."""
-
-        if product is None:
-            return
-
-        images = product.images or []
-
-        if not images:
-            return
-
-        try:
-            caption = _build_product_photo_caption(product)
-
-            await adapter.send_photo(
-                incoming.external_conversation_id,
-                images[0],
-                caption,
-            )
-
-        except Exception:
-            logger.warning(
-                "Failed to send product photo for product %s.",
-                product.id,
-                exc_info=True,
-            )
-
     @staticmethod
-    def _build_system_instruction(
-        agent: Agent,
-        knowledge_results,
-        memory_results,
-        product_results,
-    ) -> str:
-        """Build the provider-independent system instruction."""
-
+    def _build_system_instruction(agent, knowledge_results, memory_results, product_results) -> str:
         parts = [agent.instructions]
 
         if knowledge_results:
-            knowledge_lines = "\n".join(
-                f"- {chunk.content}"
-                for chunk, _score in knowledge_results
-            )
-
-            parts.append(
-                "Relevant knowledge base entries:\n"
-                f"{knowledge_lines}"
-            )
+            knowledge_lines = "\n".join(f"- {chunk.content}" for chunk, _score in knowledge_results)
+            parts.append(f"Relevant knowledge base entries:\n{knowledge_lines}")
 
         if memory_results:
-            memory_lines = "\n".join(
-                f"- {entry.content}"
-                for entry, _score in memory_results
-            )
-
-            parts.append(
-                "Relevant things you know/remember:\n"
-                f"{memory_lines}"
-            )
+            memory_lines = "\n".join(f"- {entry.content}" for entry, _score in memory_results)
+            parts.append(f"Relevant things you know/remember:\n{memory_lines}")
 
         if product_results:
             product_lines = "\n".join(
-                (
-                    f"- {product.name}: "
-                    f"{product.price} {product.currency}"
-                    + (
-                        f" ({product.discount_percent:g}% off)"
-                        if product.discount_percent
-                        else ""
-                    )
-                    + (
-                        f" - {product.description}"
-                        if product.description
-                        else ""
-                    )
-                )
-                for product, _score in product_results
+                f"- {p.name}: {p.price} {p.currency}"
+                + (f" ({p.discount_percent:g}% off)" if p.discount_percent else "")
+                + (f" - {p.description}" if p.description else "")
+                for p, _score in product_results
             )
+            parts.append(f"Relevant products/services you can sell:\n{product_lines}")
 
-            parts.append(
-                "Relevant products/services you can sell:\n"
-                f"{product_lines}"
-            )
-
-        return "\n\n".join(
-            part
-            for part in parts
-            if part and part.strip()
-        )
+        return "\n\n".join(parts)
 
     @staticmethod
-    def _build_prompt(
-        history: list[Message],
-        latest_text: str,
-    ) -> str:
-        """Build the conversational prompt from recent history."""
-
-        lines: list[str] = []
-
+    def _build_prompt(history: list[Message], latest_text: str) -> str:
+        lines = []
         for message in history:
             if message.role == MessageRole.USER:
-                lines.append(
-                    f"Customer: {message.content}"
-                )
-
+                lines.append(f"Customer: {message.content}")
             elif message.role == MessageRole.AGENT:
-                lines.append(
-                    f"You: {message.content}"
-                )
-
+                lines.append(f"You: {message.content}")
         lines.append(f"Customer: {latest_text}")
         lines.append("You:")
-
         return "\n".join(lines)
