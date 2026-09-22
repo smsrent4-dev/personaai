@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -31,6 +32,8 @@ from app.services.platforms.whatsapp_adapter import (
     WhatsAppAPIError,
     WhatsAppAdapter,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class IntegrationService:
@@ -125,10 +128,12 @@ class IntegrationService:
 
             self.db.add(integration)
 
+        existing_credentials = integration.get_credentials()
+
+        existing_credentials["bot_token"] = bot_token
+
         integration.set_credentials(
-            {
-                "bot_token": bot_token,
-            }
+            existing_credentials
         )
 
         integration.external_bot_id = (
@@ -208,6 +213,83 @@ class IntegrationService:
         )
 
         return integration
+
+    async def save_telegram_business_connection(
+        self,
+        integration: PlatformIntegration,
+        business_connection: dict,
+    ) -> None:
+        if integration.platform != Platform.TELEGRAM:
+            raise ValueError(
+                "Telegram Business connections can only be "
+                "stored on Telegram integrations."
+            )
+
+        connection_id = business_connection.get("id")
+
+        if not connection_id:
+            logger.warning(
+                "Telegram Business connection update is missing "
+                "connection id for integration %s",
+                integration.id,
+            )
+            return
+
+        user = business_connection.get("user") or {}
+        rights = business_connection.get("rights") or {}
+
+        credentials = integration.get_credentials()
+
+        credentials["business_connection"] = {
+            "id": connection_id,
+            "is_enabled": bool(
+                business_connection.get("is_enabled")
+            ),
+            "user_id": (
+                str(user["id"])
+                if user.get("id") is not None
+                else None
+            ),
+            "user_username": user.get("username"),
+            "user_first_name": user.get("first_name"),
+            "user_last_name": user.get("last_name"),
+            "rights": rights,
+            "can_manage_stories": bool(
+                rights.get("can_manage_stories")
+            ),
+        }
+
+        integration.set_credentials(
+            credentials
+        )
+
+        await self.db.commit()
+        await self.db.refresh(integration)
+
+        logger.info(
+            "Telegram Business connection updated "
+            "for integration %s: connection_id=%s "
+            "enabled=%s can_manage_stories=%s",
+            integration.id,
+            connection_id,
+            business_connection.get("is_enabled"),
+            rights.get("can_manage_stories"),
+        )
+
+    async def get_telegram_business_connection(
+        self,
+        integration: PlatformIntegration,
+    ) -> dict | None:
+        if integration.platform != Platform.TELEGRAM:
+            raise ValueError(
+                "The supplied integration is not a Telegram integration."
+            )
+
+        credentials = integration.get_credentials()
+
+        return credentials.get(
+            "business_connection"
+        )
 
     async def _get_whatsapp_profile(
         self,
@@ -501,13 +583,19 @@ class IntegrationService:
 
             self.db.add(integration)
 
-        integration.set_credentials(
+        existing_credentials = integration.get_credentials()
+
+        existing_credentials.update(
             {
                 "phone_number_id": phone_number_id,
                 "access_token": access_token,
                 "verify_token": verify_token,
                 "webhook_secret": webhook_secret or "",
             }
+        )
+
+        integration.set_credentials(
+            existing_credentials
         )
 
         integration.external_bot_id = phone_number_id
@@ -750,8 +838,10 @@ class IntegrationService:
                 await adapter.aclose()
 
         if platform == Platform.TELEGRAM:
+            credentials = integration.get_credentials()
+
             adapter = TelegramAdapter(
-                bot_token=integration.get_credentials().get(
+                bot_token=credentials.get(
                     "bot_token",
                     "",
                 )

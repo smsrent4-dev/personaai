@@ -21,3 +21,15 @@ from app.models.subscription import Subscription  # noqa: F401
 from app.models.user import User  # noqa: F401
 from app.models.verification_token import VerificationToken  # noqa: F401
 from app.models.whatsapp_profile import WhatsAppBusinessProfile  # noqa: F401
+
+from app.models.social_post import (  # noqa: F401
+    SocialMediaType,
+    SocialPost,
+    SocialPostStatus,
+)
+
+from app.models.social_post_publication import (  # noqa: F401
+    SocialPostPublication,
+    SocialPublicationPlatform,
+    SocialPublicationStatus,
+)
