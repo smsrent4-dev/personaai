@@ -1,486 +1,295 @@
+"""Google Gemini implementation of AIProvider.
+
+Talks to the REST API directly over httpx rather than pulling in the
+`google-generativeai` SDK — one less heavyweight, fast-moving dependency
+for a client that's really just two JSON endpoints. Swappable for the
+official SDK later without changing this class's public surface.
 """
-Gemini implementation of AIProvider.
-This is the only file in the codebase that should import google.genai.
-Everything else talks to the AIProvider interface in app/ai/base.py.
-"""
-import json
-from google import genai
-from google.genai import types
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
-from app.ai.base import (
-    AIProvider,
-    EmbeddingResult,
-    GenerationResult,
-    ImageGenerationResult,
-    MediaInput,
-    Message,
-    StructuredResult,
-)
-from app.core.config import settings
-from app.core.logging import get_logger
-logger = get_logger(__name__)
-_RETRYABLE_EXCEPTIONS = (
-    TimeoutError,
-    ConnectionError,
-)
-# Gemini native image-generation model.
-#
-# This is intentionally separate from settings.gemini_model.
-# Your normal/routine Gemini model is still used for:
-# - text generation
-# - structured generation
-# - media understanding
-#
-# Image generation uses this model only.
-_GEMINI_IMAGE_MODEL = "gemini-2.5-flash-image"
-def _to_gemini_contents(
-    messages: list[Message],
-) -> list[types.Content]:
-    """
-    Convert application Message objects into
-    Gemini Content objects.
-    """
-    contents: list[types.Content] = []
-    for message in messages:
-        role = (
-            "model"
-            if message.role == "assistant"
-            else "user"
-        )
-        contents.append(
-            types.Content(
-                role=role,
-                parts=[
-                    types.Part.from_text(
-                        text=message.content,
-                    )
-                ],
-            )
-        )
-    return contents
+import base64
+import logging
+
+import httpx
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from app.config import settings
+from app.services.ai.base import AIProvider, ToolDefinition, ToolExecutor
+from app.services.ai.exceptions import AIAuthenticationError, AIProviderError, AIRateLimitError
+
+logger = logging.getLogger(__name__)
+
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+
+class _TransientAIError(Exception):
+    """Internal-only: marks an error as worth retrying (timeouts, 5xx)."""
+
+
 class GeminiProvider(AIProvider):
-    """
-    Gemini implementation of the AIProvider interface.
-    Supports:
-    - Text generation
-    - Structured JSON generation
-    - Image/document/audio understanding
-    - Text embeddings
-    - Image generation
-    Only this file should import google.genai.
-    """
+    name = "gemini"
+
     def __init__(
         self,
         api_key: str | None = None,
+        model: str | None = None,
+        embedding_model: str | None = None,
+        timeout: float = 30.0,
     ):
-        api_key = (
-            api_key
-            or settings.gemini_api_key
-        )
-        if not api_key:
-            raise ValueError(
-                "Gemini API key is not configured"
+        self.api_key = api_key or settings.GEMINI_API_KEY
+        self.model = model or settings.GEMINI_MODEL
+        self.embedding_model = embedding_model or settings.GEMINI_EMBEDDING_MODEL
+        self._client = httpx.AsyncClient(base_url=GEMINI_API_BASE, timeout=timeout)
+
+        if not self.api_key:
+            logger.warning(
+                "GeminiProvider initialized without an API key — "
+                "requests will fail until GEMINI_API_KEY is set."
             )
-        self._client = genai.Client(
-            api_key=api_key,
-        )
-        self._ai = self._client.aio
-        # Your existing routine/text model.
-        self._text_model_name = (
-            settings.gemini_model
-        )
-        # Embedding model.
-        self._embedding_model_name = (
-            "gemini-embedding-2"
-        )
-        # Your pgvector embedding dimension.
-        self._embedding_dimension = 768
-    # ================================================================
-    # TEXT GENERATION
-    # ================================================================
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
     @retry(
-        reraise=True,
+        retry=retry_if_exception_type(_TransientAIError),
         stop=stop_after_attempt(3),
-        wait=wait_exponential(
-            multiplier=1,
-            min=1,
-            max=8,
-        ),
-        retry=retry_if_exception_type(
-            _RETRYABLE_EXCEPTIONS
-        ),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        reraise=True,
     )
-    async def generate_text(
+    async def _post(self, path: str, json_body: dict) -> dict:
+        try:
+            resp = await self._client.post(
+                f"{path}", params={"key": self.api_key}, json=json_body
+            )
+        except httpx.TimeoutException as exc:
+            raise _TransientAIError(str(exc)) from exc
+        except httpx.TransportError as exc:
+            raise _TransientAIError(str(exc)) from exc
+
+        if resp.status_code == 401 or resp.status_code == 403:
+            raise AIAuthenticationError("Invalid or missing Gemini API key", self.name)
+        if resp.status_code == 429:
+            raise AIRateLimitError("Gemini rate limit exceeded", self.name)
+        if 500 <= resp.status_code < 600:
+            raise _TransientAIError(f"Gemini returned {resp.status_code}: {resp.text}")
+        if resp.status_code >= 400:
+            raise AIProviderError(f"Gemini request failed ({resp.status_code}): {resp.text}", self.name)
+
+        return resp.json()
+
+    @staticmethod
+    def _extract_text(data: dict) -> str:
+        try:
+            candidates = data["candidates"]
+            if not candidates:
+                raise AIProviderError("Gemini returned no candidates (likely blocked by safety filters)", "gemini")
+            parts = candidates[0]["content"]["parts"]
+            return "".join(p.get("text", "") for p in parts).strip()
+        except (KeyError, IndexError) as exc:
+            raise AIProviderError(f"Unexpected Gemini response shape: {data}", "gemini", exc) from exc
+
+    async def generate(
         self,
-        messages: list[Message],
-        *,
-        system_prompt: str | None = None,
+        prompt: str,
+        system_instruction: str | None = None,
         temperature: float = 0.7,
-        max_output_tokens: int = 2048,
-    ) -> GenerationResult:
-        """
-        Generate normal text using the configured
-        Gemini routine model.
-        """
-        if not messages:
-            raise ValueError(
-                "At least one message is required"
-            )
-        contents = _to_gemini_contents(
-            messages
-        )
-        response = (
-            await self._ai.models.generate_content(
-                model=self._text_model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    temperature=temperature,
-                    max_output_tokens=max_output_tokens,
-                ),
-            )
-        )
-        usage = getattr(
-            response,
-            "usage_metadata",
-            None,
-        )
-        return GenerationResult(
-            text=response.text or "",
-            raw=response,
-            input_tokens=getattr(
-                usage,
-                "prompt_token_count",
-                None,
-            ),
-            output_tokens=getattr(
-                usage,
-                "candidates_token_count",
-                None,
-            ),
-        )
-    # ================================================================
-    # STRUCTURED GENERATION
-    # ================================================================
-    @retry(
-        reraise=True,
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(
-            multiplier=1,
-            min=1,
-            max=8,
-        ),
-        retry=retry_if_exception_type(
-            _RETRYABLE_EXCEPTIONS
-        ),
-    )
-    async def generate_structured(
-        self,
-        messages: list[Message],
-        *,
-        schema: dict,
-        system_prompt: str | None = None,
-        temperature: float = 0.0,
-    ) -> StructuredResult:
-        """
-        Generate structured JSON using Gemini.
-        """
-        if not messages:
-            raise ValueError(
-                "At least one message is required"
-            )
-        contents = _to_gemini_contents(
-            messages
-        )
-        response = (
-            await self._ai.models.generate_content(
-                model=self._text_model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    temperature=temperature,
-                    response_mime_type="application/json",
-                    response_schema=schema,
-                ),
-            )
-        )
-        raw_text = response.text or ""
-        try:
-            data = json.loads(
-                raw_text
-            )
-        except (
-            json.JSONDecodeError,
-            ValueError,
-        ) as exc:
-            logger.error(
-                "gemini_structured_parse_failed",
-                error=str(exc),
-                response=raw_text[:1000],
-            )
-            raise ValueError(
-                "Gemini returned non-JSON output "
-                "for a structured request"
-            ) from exc
-        return StructuredResult(
-            data=data,
-            raw=response,
-        )
-    # ================================================================
-    # MEDIA UNDERSTANDING
-    # ================================================================
-    async def understand_media(
-        self,
-        media: MediaInput,
-        prompt: str,
-        *,
-        system_prompt: str | None = None,
-    ) -> GenerationResult:
-        """
-        Understand images, audio, PDFs, and other
-        supported media using the configured
-        Gemini routine model.
-        """
-        if not media.data:
-            raise ValueError(
-                "Media data cannot be empty"
-            )
-        if not media.media_type:
-            raise ValueError(
-                "Media MIME type is required"
-            )
-        response = (
-            await self._ai.models.generate_content(
-                model=self._text_model_name,
-                contents=[
-                    types.Part.from_bytes(
-                        data=media.data,
-                        mime_type=media.media_type,
-                    ),
-                    types.Part.from_text(
-                        text=prompt,
-                    ),
-                ],
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                ),
-            )
-        )
-        usage = getattr(
-            response,
-            "usage_metadata",
-            None,
-        )
-        return GenerationResult(
-            text=response.text or "",
-            raw=response,
-            input_tokens=getattr(
-                usage,
-                "prompt_token_count",
-                None,
-            ),
-            output_tokens=getattr(
-                usage,
-                "candidates_token_count",
-                None,
-            ),
-        )
-    # ================================================================
-    # EMBEDDINGS
-    # ================================================================
-    async def embed(
-        self,
-        texts: list[str],
-    ) -> EmbeddingResult:
-        """
-        Generate embeddings for a list of texts.
-        """
-        if not texts:
-            return EmbeddingResult(
-                vectors=[],
-                model=self._embedding_model_name,
-            )
-        response = (
-            await self._ai.models.embed_content(
-                model=self._embedding_model_name,
-                contents=texts,
-                config=types.EmbedContentConfig(
-                    output_dimensionality=(
-                        self._embedding_dimension
-                    ),
-                ),
-            )
-        )
-        vectors = [
-            embedding.values
-            for embedding in response.embeddings
-        ]
-        return EmbeddingResult(
-            vectors=vectors,
-            model=self._embedding_model_name,
-        )
-    # ================================================================
-    # IMAGE GENERATION
-    # ================================================================
-    @retry(
-        reraise=True,
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(
-            multiplier=1,
-            min=1,
-            max=8,
-        ),
-        retry=retry_if_exception_type(
-            _RETRYABLE_EXCEPTIONS
-        ),
-    )
-    async def generate_image(
-        self,
-        prompt: str,
-        *,
-        aspect_ratio: str = "1:1",
-    ) -> ImageGenerationResult:
-        """
-        Generate an image using Gemini 2.5 Flash Image.
-        The image model is deliberately hard-coded here so
-        it cannot accidentally use the normal GEMINI_MODEL
-        or an obsolete Imagen model.
-        Generated image data is returned as bytes.
-        """
-        if not prompt or not prompt.strip():
-            raise ValueError(
-                "Image generation prompt cannot be empty"
-            )
-        supported_aspect_ratios = {
-            "1:1",
-            "1:4",
-            "4:1",
-            "1:8",
-            "8:1",
-            "2:3",
-            "3:2",
-            "3:4",
-            "4:3",
-            "4:5",
-            "5:4",
-            "9:16",
-            "16:9",
-            "21:9",
+        max_tokens: int | None = None,
+    ) -> str:
+        body: dict = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": temperature},
         }
-        if aspect_ratio not in supported_aspect_ratios:
-            raise ValueError(
-                "Unsupported aspect ratio: "
-                f"{aspect_ratio}. "
-                "Supported values: "
-                f"{', '.join(sorted(supported_aspect_ratios))}"
-            )
+        if max_tokens is not None:
+            body["generationConfig"]["maxOutputTokens"] = max_tokens
+        if system_instruction:
+            body["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+
         try:
-            logger.info(
-                "gemini_image_generation_started",
-                model=_GEMINI_IMAGE_MODEL,
-                aspect_ratio=aspect_ratio,
-            )
-            # IMPORTANT:
-            #
-            # Do NOT use:
-            #
-            # response_format={
-            #     "image": {
-            #         "aspect_ratio": aspect_ratio
-            #     }
-            # }
-            #
-            # GenerateContentConfig does not support
-            # response_format.
-            #
-            # Image generation uses response_modalities
-            # and image_config instead.
-            response = (
-                await self._ai.models.generate_content(
-                    model=_GEMINI_IMAGE_MODEL,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_modalities=[
-                            "IMAGE"
-                        ],
-                        image_config=types.ImageConfig(
-                            aspect_ratio=aspect_ratio,
-                        ),
-                    ),
-                )
-            )
-            image_bytes: bytes | None = None
-            mime_type = "image/png"
-            if response.candidates:
-                for candidate in response.candidates:
-                    if not candidate.content:
-                        continue
-                    parts = (
-                        candidate.content.parts
-                        or []
+            data = await self._post(f"/models/{self.model}:generateContent", body)
+        except _TransientAIError as exc:
+            raise AIProviderError("Gemini unavailable after retries", self.name, exc) from exc
+
+        return self._extract_text(data)
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+
+        body = {
+            "requests": [
+                {
+                    "model": f"models/{self.embedding_model}",
+                    "content": {"parts": [{"text": t}]},
+                }
+                for t in texts
+            ]
+        }
+
+        try:
+            data = await self._post(f"/models/{self.embedding_model}:batchEmbedContents", body)
+        except _TransientAIError as exc:
+            raise AIProviderError("Gemini unavailable after retries", self.name, exc) from exc
+
+        try:
+            return [item["values"] for item in data["embeddings"]]
+        except (KeyError, IndexError) as exc:
+            raise AIProviderError(f"Unexpected Gemini embedding response shape: {data}", self.name, exc) from exc
+
+    async def summarize(self, text: str, max_words: int | None = None) -> str:
+        constraint = f" in no more than {max_words} words" if max_words else " concisely"
+        prompt = (
+            f"Summarize the following text{constraint}. "
+            f"Output only the summary, no preamble.\n\nTEXT:\n{text}"
+        )
+        return await self.generate(prompt, temperature=0.3)
+
+    async def classify(self, text: str, labels: list[str]) -> str:
+        if not labels:
+            raise AIProviderError("classify() called with an empty label set", self.name)
+
+        label_list = "\n".join(f"- {label}" for label in labels)
+        prompt = (
+            "Classify the following text into exactly one of these categories. "
+            "Respond with only the category name, exactly as written below, and nothing else.\n\n"
+            f"Categories:\n{label_list}\n\nText:\n{text}"
+        )
+        raw = await self.generate(prompt, temperature=0.0)
+        cleaned = raw.strip().strip('"').strip("'")
+
+        for label in labels:
+            if cleaned.lower() == label.lower():
+                return label
+        for label in labels:
+            if label.lower() in cleaned.lower():
+                return label
+
+        raise AIProviderError(
+            f"Gemini returned '{raw}', which doesn't match any of {labels}", self.name
+        )
+
+    async def describe_image(self, image_bytes: bytes, mime_type: str, instruction: str | None = None) -> str:
+        """Real vision call via Gemini's multimodal generateContent —
+        the image goes in as an inline_data part alongside the prompt.
+        Inline data is capped at ~20MB by the API; larger files would
+        need the separate Files API upload flow, not implemented here
+        since Telegram/WhatsApp photos and voice notes are well under
+        that in practice."""
+        prompt_text = instruction or (
+            "Describe this image in detail. Note any visible text, numbers, amounts, dates, or "
+            "reference/transaction IDs exactly as they appear, and describe any products, "
+            "packaging, or app/screenshot UI shown."
+        )
+        body = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": prompt_text},
+                        {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode("ascii")}},
+                    ],
+                }
+            ],
+            "generationConfig": {"temperature": 0.2},
+        }
+        try:
+            data = await self._post(f"/models/{self.model}:generateContent", body)
+        except _TransientAIError as exc:
+            raise AIProviderError("Gemini unavailable after retries", self.name, exc) from exc
+        return self._extract_text(data)
+
+    async def transcribe_audio(self, audio_bytes: bytes, mime_type: str) -> str:
+        prompt_text = (
+            "Transcribe the speech in this audio clip verbatim, in its original language. "
+            "Output only the transcript — no preamble, no translation, no description of tone."
+        )
+        body = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": prompt_text},
+                        {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(audio_bytes).decode("ascii")}},
+                    ],
+                }
+            ],
+            "generationConfig": {"temperature": 0.0},
+        }
+        try:
+            data = await self._post(f"/models/{self.model}:generateContent", body)
+        except _TransientAIError as exc:
+            raise AIProviderError("Gemini unavailable after retries", self.name, exc) from exc
+        return self._extract_text(data)
+
+    async def generate_with_tools(
+        self,
+        prompt: str,
+        tools: list[ToolDefinition],
+        tool_executor: ToolExecutor,
+        system_instruction: str | None = None,
+        temperature: float = 0.7,
+        max_tool_iterations: int = 5,
+    ) -> str:
+        """Real function-calling via Gemini's REST API `tools` field. The
+        model returns a `functionCall` part instead of `text` when it
+        wants to call something; we execute it and feed a
+        `functionResponse` part back in a new turn, repeating until the
+        model settles on a plain-text answer.
+
+        This is the concrete realization of the "AI decides when to
+        search products / create orders" decision engine — no hardcoded
+        if/else routing between "just reply" and "take an action";
+        Gemini's own tool-choice reasoning makes that call each turn.
+        """
+        if not tools:
+            return await self.generate(prompt, system_instruction=system_instruction, temperature=temperature)
+
+        contents: list[dict] = [{"role": "user", "parts": [{"text": prompt}]}]
+        function_declarations = [
+            {"name": t.name, "description": t.description, "parameters": t.parameters} for t in tools
+        ]
+        body_base: dict = {
+            "generationConfig": {"temperature": temperature},
+            "tools": [{"functionDeclarations": function_declarations}],
+        }
+        if system_instruction:
+            body_base["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+
+        for _ in range(max_tool_iterations):
+            body = {**body_base, "contents": contents}
+            try:
+                data = await self._post(f"/models/{self.model}:generateContent", body)
+            except _TransientAIError as exc:
+                raise AIProviderError("Gemini unavailable after retries", self.name, exc) from exc
+
+            try:
+                candidates = data["candidates"]
+                if not candidates:
+                    raise AIProviderError(
+                        "Gemini returned no candidates (likely blocked by safety filters)", self.name
                     )
-                    for part in parts:
-                        inline_data = getattr(
-                            part,
-                            "inline_data",
-                            None,
-                        )
-                        if inline_data is None:
-                            continue
-                        data = getattr(
-                            inline_data,
-                            "data",
-                            None,
-                        )
-                        if not data:
-                            continue
-                        image_bytes = data
-                        mime_type = (
-                            getattr(
-                                inline_data,
-                                "mime_type",
-                                None,
-                            )
-                            or "image/png"
-                        )
-                        break
-                    if image_bytes:
-                        break
-            if not image_bytes:
-                logger.error(
-                    "gemini_image_generation_empty",
-                    model=_GEMINI_IMAGE_MODEL,
-                    response=str(response)[:3000],
-                )
-                raise RuntimeError(
-                    "Gemini returned no image data"
-                )
-            logger.info(
-                "gemini_image_generation_completed",
-                model=_GEMINI_IMAGE_MODEL,
-                mime_type=mime_type,
-                bytes=len(image_bytes),
+                model_content = candidates[0]["content"]
+                parts = model_content.get("parts", [])
+            except (KeyError, IndexError) as exc:
+                raise AIProviderError(f"Unexpected Gemini response shape: {data}", self.name, exc) from exc
+
+            function_call = next((p["functionCall"] for p in parts if "functionCall" in p), None)
+            if function_call is None:
+                return "".join(p.get("text", "") for p in parts).strip()
+
+            tool_name = function_call["name"]
+            tool_args = function_call.get("args", {})
+            try:
+                result = await tool_executor(tool_name, tool_args)
+            except Exception as exc:  # noqa: BLE001 — feed the error back to the model, don't crash the reply
+                result = {"error": str(exc)}
+
+            # Gemini requires functionResponse payloads to strictly be a JSON object (dict)
+            if not isinstance(result, dict):
+                result = {"result": result}
+
+            contents.append(model_content)
+            contents.append(
+                {"role": "user", "parts": [{"functionResponse": {"name": tool_name, "response": result}}]}
             )
-            return ImageGenerationResult(
-                image_data=image_bytes,
-                mime_type=mime_type,
-            )
-        except (
-            TimeoutError,
-            ConnectionError,
-        ):
-            raise
-        except Exception as exc:
-            logger.error(
-                "gemini_image_generation_failed",
-                model=_GEMINI_IMAGE_MODEL,
-                error=str(exc),
-            )
-            raise RuntimeError(
-                f"Image generation failed: {exc}"
-            ) from exc
+
+        raise AIProviderError(
+            f"Tool-calling loop exceeded {max_tool_iterations} iterations without a final answer", self.name
+        )
