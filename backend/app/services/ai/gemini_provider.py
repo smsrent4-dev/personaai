@@ -21,19 +21,22 @@ Embedding configuration:
 PersonaAI stores embeddings as 768-dimensional vectors, so the embedding
 dimension is explicitly requested to remain compatible with the existing
 pgvector schema.
+
+The HTTP transport implements bounded retries with exponential backoff and
+jitter for transient Gemini failures such as 429, 500, 502, 503, and 504.
+API credentials are sent through the x-goog-api-key header rather than being
+placed in request URLs.
 """
 
+from __future__ import annotations
+
+import asyncio
 import base64
 import logging
+import random
 from typing import Any
 
 import httpx
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
 from app.config import settings
 from app.services.ai.base import AIProvider, ToolDefinition, ToolExecutor
@@ -55,13 +58,39 @@ GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 # PersonaAI's existing pgvector schema uses 768 dimensions.
 GEMINI_EMBEDDING_DIMENSION = 768
 
-# Gemini's current embedding model.
+# Gemini embedding model.
 DEFAULT_GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
 
-# text-embedding-004 is retired and must never be sent to Gemini.
+# Retired Gemini embedding models.
 RETIRED_EMBEDDING_MODELS = {
     "text-embedding-004",
     "models/text-embedding-004",
+}
+
+# Gemini inline media should remain comfortably below the documented
+# request-size limit. Larger media should use the Gemini Files API.
+MAX_INLINE_IMAGE_BYTES = 15 * 1024 * 1024
+
+# Default HTTP timeout configuration.
+DEFAULT_CONNECT_TIMEOUT = 10.0
+DEFAULT_READ_TIMEOUT = 45.0
+DEFAULT_WRITE_TIMEOUT = 30.0
+DEFAULT_POOL_TIMEOUT = 10.0
+
+# Interactive requests should not consume workers indefinitely.
+DEFAULT_MAX_ATTEMPTS = 3
+
+# Exponential backoff configuration.
+RETRY_MIN_SECONDS = 1.0
+RETRY_MAX_SECONDS = 8.0
+
+# Gemini/API failures that are considered transient.
+TRANSIENT_STATUS_CODES = {
+    408,
+    500,
+    502,
+    503,
+    504,
 }
 
 
@@ -79,7 +108,7 @@ class GeminiProvider(AIProvider):
         api_key: str | None = None,
         model: str | None = None,
         embedding_model: str | None = None,
-        timeout: float = 30.0,
+        timeout: float | None = None,
     ):
         self.api_key = api_key or settings.GEMINI_API_KEY
 
@@ -99,22 +128,66 @@ class GeminiProvider(AIProvider):
 
         self._client = httpx.AsyncClient(
             base_url=GEMINI_API_BASE,
-            timeout=timeout,
+            timeout=self._build_timeout(timeout),
+            headers=self._build_headers(),
         )
 
         if not self.api_key:
             logger.warning(
-                "GeminiProvider initialized without an API key — "
-                "requests will fail until GEMINI_API_KEY is set."
+                "GeminiProvider initialized without an API key. "
+                "Requests will fail until GEMINI_API_KEY is configured."
             )
 
         logger.info(
-            "GeminiProvider initialized: model=%s embedding_model=%s "
-            "embedding_dimension=%s",
+            "GeminiProvider initialized: model=%s "
+            "embedding_model=%s embedding_dimension=%s",
             self.model,
             self.embedding_model,
             GEMINI_EMBEDDING_DIMENSION,
         )
+
+    # -----------------------------------------------------------------------
+    # HTTP configuration
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _build_timeout(
+        timeout: float | None,
+    ) -> httpx.Timeout:
+        """Build an HTTPX timeout configuration."""
+
+        if timeout is not None:
+            if timeout <= 0:
+                raise ValueError(
+                    "GeminiProvider timeout must be greater than zero."
+                )
+
+            return httpx.Timeout(
+                timeout,
+                connect=timeout,
+                read=timeout,
+                write=timeout,
+                pool=timeout,
+            )
+
+        return httpx.Timeout(
+            connect=DEFAULT_CONNECT_TIMEOUT,
+            read=DEFAULT_READ_TIMEOUT,
+            write=DEFAULT_WRITE_TIMEOUT,
+            pool=DEFAULT_POOL_TIMEOUT,
+        )
+
+    def _build_headers(self) -> dict[str, str]:
+        """Build Gemini HTTP headers without exposing credentials in URLs."""
+
+        headers = {
+            "Content-Type": "application/json",
+        }
+
+        if self.api_key:
+            headers["x-goog-api-key"] = self.api_key
+
+        return headers
 
     # -----------------------------------------------------------------------
     # Model helpers
@@ -122,33 +195,27 @@ class GeminiProvider(AIProvider):
 
     @staticmethod
     def _clean_model_name(model: str) -> str:
-        """Remove an optional leading 'models/' prefix.
+        """Remove an optional leading 'models/' prefix."""
 
-        Internally this provider stores model names without the REST resource
-        prefix and adds it only where the Gemini API requires it.
-        """
         return model.strip().removeprefix("models/")
 
     @classmethod
-    def _normalize_embedding_model(cls, model: str) -> str:
-        """Normalize and protect against the retired text-embedding-004.
+    def _normalize_embedding_model(
+        cls,
+        model: str,
+    ) -> str:
+        """Normalize embedding model configuration."""
 
-        Older .env/config values may still contain text-embedding-004.
-        Rather than allowing that stale configuration to produce a 404,
-        automatically migrate it to gemini-embedding-001.
-        """
         clean_model = cls._clean_model_name(model)
 
-        if clean_model in {
-            "text-embedding-004",
-            "models/text-embedding-004",
-        }:
+        if clean_model in RETIRED_EMBEDDING_MODELS:
             logger.warning(
                 "Configured Gemini embedding model '%s' is retired. "
                 "Automatically using '%s' instead.",
                 model,
                 DEFAULT_GEMINI_EMBEDDING_MODEL,
             )
+
             return DEFAULT_GEMINI_EMBEDDING_MODEL
 
         return clean_model
@@ -159,85 +226,300 @@ class GeminiProvider(AIProvider):
 
     async def aclose(self) -> None:
         """Close the underlying HTTP client."""
+
         await self._client.aclose()
+
+    # -----------------------------------------------------------------------
+    # Retry helpers
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_retry_after(
+        response: httpx.Response,
+    ) -> float | None:
+        """Parse a numeric Retry-After header."""
+
+        value = response.headers.get("retry-after")
+
+        if not value:
+            return None
+
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            return None
+
+        if seconds < 0:
+            return None
+
+        return min(
+            seconds,
+            RETRY_MAX_SECONDS,
+        )
+
+    @staticmethod
+    async def _sleep_before_retry(
+        attempt: int,
+        retry_after: float | None = None,
+    ) -> None:
+        """Sleep using bounded exponential backoff with full jitter."""
+
+        if retry_after is not None:
+            delay = retry_after
+
+        else:
+            exponential_delay = min(
+                RETRY_MAX_SECONDS,
+                RETRY_MIN_SECONDS * (2 ** (attempt - 1)),
+            )
+
+            delay = random.uniform(
+                0.0,
+                exponential_delay,
+            )
+
+        logger.info(
+            "Retrying Gemini request: next_attempt=%s delay=%.2fs",
+            attempt + 1,
+            delay,
+        )
+
+        await asyncio.sleep(delay)
+
+    # -----------------------------------------------------------------------
+    # Error helpers
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _safe_error_message(
+        response: httpx.Response,
+    ) -> str:
+        """Extract a bounded Gemini error message without leaking secrets."""
+
+        try:
+            payload = response.json()
+
+        except ValueError:
+            text = response.text.strip()
+
+            if not text:
+                return "Gemini returned an empty error response."
+
+            return text[:1000]
+
+        if isinstance(payload, dict):
+            error = payload.get("error")
+
+            if isinstance(error, dict):
+                message = error.get("message")
+
+                if isinstance(message, str) and message.strip():
+                    return message.strip()[:1000]
+
+        return "Gemini returned an unexpected error response."
 
     # -----------------------------------------------------------------------
     # HTTP transport
     # -----------------------------------------------------------------------
 
-    @retry(
-        retry=retry_if_exception_type(_TransientAIError),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(
-            multiplier=1,
-            min=1,
-            max=8,
-        ),
-        reraise=True,
-    )
     async def _post(
         self,
         path: str,
         json_body: dict[str, Any],
+        *,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     ) -> dict[str, Any]:
-        """POST JSON to Gemini with retry handling for transient failures."""
+        """POST JSON to Gemini with bounded transient-error retries."""
 
-        try:
-            response = await self._client.post(
-                path,
-                params={"key": self.api_key},
-                json=json_body,
-            )
-
-        except httpx.TimeoutException as exc:
-            raise _TransientAIError(
-                f"Gemini request timed out: {exc}"
-            ) from exc
-
-        except httpx.TransportError as exc:
-            raise _TransientAIError(
-                f"Gemini transport error: {exc}"
-            ) from exc
-
-        if response.status_code in (401, 403):
+        if not self.api_key:
             raise AIAuthenticationError(
-                "Invalid or missing Gemini API key",
+                "Gemini API key is not configured.",
                 self.name,
             )
 
-        if response.status_code == 429:
-            raise AIRateLimitError(
-                "Gemini rate limit exceeded",
-                self.name,
+        if max_attempts < 1:
+            raise ValueError(
+                "max_attempts must be at least 1."
             )
 
-        if 500 <= response.status_code < 600:
-            raise _TransientAIError(
-                f"Gemini returned {response.status_code}: {response.text}"
-            )
+        last_exception: Exception | None = None
 
-        if response.status_code >= 400:
-            raise AIProviderError(
-                f"Gemini request failed ({response.status_code}): "
-                f"{response.text}",
-                self.name,
-            )
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = await self._client.post(
+                    path,
+                    json=json_body,
+                )
 
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise AIProviderError(
-                f"Gemini returned invalid JSON: {response.text}",
-                self.name,
-                exc,
-            ) from exc
+            except httpx.TimeoutException as exc:
+                last_exception = exc
+
+                logger.warning(
+                    "Gemini request timeout: "
+                    "attempt=%s/%s model=%s path=%s error=%s",
+                    attempt,
+                    max_attempts,
+                    self.model,
+                    path,
+                    type(exc).__name__,
+                )
+
+                if attempt >= max_attempts:
+                    raise _TransientAIError(
+                        "Gemini request timed out after "
+                        f"{max_attempts} attempts."
+                    ) from exc
+
+                await self._sleep_before_retry(attempt)
+                continue
+
+            except httpx.TransportError as exc:
+                last_exception = exc
+
+                logger.warning(
+                    "Gemini transport error: "
+                    "attempt=%s/%s model=%s path=%s error=%s",
+                    attempt,
+                    max_attempts,
+                    self.model,
+                    path,
+                    type(exc).__name__,
+                )
+
+                if attempt >= max_attempts:
+                    raise _TransientAIError(
+                        "Gemini transport failed after "
+                        f"{max_attempts} attempts."
+                    ) from exc
+
+                await self._sleep_before_retry(attempt)
+                continue
+
+            status_code = response.status_code
+
+            # ---------------------------------------------------------------
+            # Authentication / authorization
+            # ---------------------------------------------------------------
+
+            if status_code in {401, 403}:
+                message = self._safe_error_message(response)
+
+                raise AIAuthenticationError(
+                    f"Gemini authentication or permission failed: "
+                    f"{message}",
+                    self.name,
+                )
+
+            # ---------------------------------------------------------------
+            # Rate limiting
+            # ---------------------------------------------------------------
+
+            if status_code == 429:
+                if attempt >= max_attempts:
+                    raise AIRateLimitError(
+                        "Gemini rate limit exceeded after retries.",
+                        self.name,
+                    )
+
+                retry_after = self._parse_retry_after(response)
+
+                logger.warning(
+                    "Gemini rate limited: "
+                    "attempt=%s/%s model=%s retry_after=%s",
+                    attempt,
+                    max_attempts,
+                    self.model,
+                    retry_after,
+                )
+
+                await self._sleep_before_retry(
+                    attempt,
+                    retry_after=retry_after,
+                )
+
+                continue
+
+            # ---------------------------------------------------------------
+            # Transient server errors
+            # ---------------------------------------------------------------
+
+            if status_code in TRANSIENT_STATUS_CODES:
+                last_exception = _TransientAIError(
+                    f"Gemini returned transient HTTP {status_code}."
+                )
+
+                if attempt >= max_attempts:
+                    raise _TransientAIError(
+                        "Gemini returned HTTP "
+                        f"{status_code} after {max_attempts} attempts."
+                    ) from last_exception
+
+                logger.warning(
+                    "Gemini transient failure: "
+                    "status=%s attempt=%s/%s model=%s path=%s",
+                    status_code,
+                    attempt,
+                    max_attempts,
+                    self.model,
+                    path,
+                )
+
+                retry_after = self._parse_retry_after(response)
+
+                await self._sleep_before_retry(
+                    attempt,
+                    retry_after=retry_after,
+                )
+
+                continue
+
+            # ---------------------------------------------------------------
+            # Permanent client errors
+            # ---------------------------------------------------------------
+
+            if status_code >= 400:
+                message = self._safe_error_message(response)
+
+                raise AIProviderError(
+                    f"Gemini request failed ({status_code}): "
+                    f"{message}",
+                    self.name,
+                )
+
+            # ---------------------------------------------------------------
+            # Successful response
+            # ---------------------------------------------------------------
+
+            try:
+                data = response.json()
+
+            except ValueError as exc:
+                raise AIProviderError(
+                    "Gemini returned invalid JSON.",
+                    self.name,
+                    exc,
+                ) from exc
+
+            if not isinstance(data, dict):
+                raise AIProviderError(
+                    "Gemini returned an unexpected JSON response.",
+                    self.name,
+                )
+
+            return data
+
+        raise _TransientAIError(
+            "Gemini request failed after retries."
+        ) from last_exception
 
     # -----------------------------------------------------------------------
     # Response extraction
     # -----------------------------------------------------------------------
 
     @staticmethod
-    def _extract_text(data: dict[str, Any]) -> str:
+    def _extract_text(
+        data: dict[str, Any],
+    ) -> str:
         """Extract combined text from Gemini's first candidate."""
 
         try:
@@ -246,7 +528,7 @@ class GeminiProvider(AIProvider):
             if not candidates:
                 raise AIProviderError(
                     "Gemini returned no candidates "
-                    "(likely blocked by safety filters)",
+                    "(likely blocked by safety filters).",
                     "gemini",
                 )
 
@@ -260,7 +542,7 @@ class GeminiProvider(AIProvider):
 
             if not text:
                 raise AIProviderError(
-                    f"Gemini returned no text content: {data}",
+                    "Gemini returned no text content.",
                     "gemini",
                 )
 
@@ -271,7 +553,7 @@ class GeminiProvider(AIProvider):
 
         except (KeyError, IndexError, TypeError) as exc:
             raise AIProviderError(
-                f"Unexpected Gemini response shape: {data}",
+                "Unexpected Gemini response shape.",
                 "gemini",
                 exc,
             ) from exc
@@ -288,7 +570,7 @@ class GeminiProvider(AIProvider):
             if not candidates:
                 raise AIProviderError(
                     "Gemini returned no candidates "
-                    "(likely blocked by safety filters)",
+                    "(likely blocked by safety filters).",
                     "gemini",
                 )
 
@@ -297,7 +579,7 @@ class GeminiProvider(AIProvider):
 
             if not isinstance(parts, list):
                 raise AIProviderError(
-                    f"Gemini returned invalid parts: {parts}",
+                    "Gemini returned invalid candidate parts.",
                     "gemini",
                 )
 
@@ -308,7 +590,7 @@ class GeminiProvider(AIProvider):
 
         except (KeyError, IndexError, TypeError) as exc:
             raise AIProviderError(
-                f"Unexpected Gemini tool response shape: {data}",
+                "Unexpected Gemini tool response shape.",
                 "gemini",
                 exc,
             ) from exc
@@ -322,9 +604,11 @@ class GeminiProvider(AIProvider):
         return [
             part["functionCall"]
             for part in parts
-            if isinstance(part, dict)
-            and "functionCall" in part
-            and isinstance(part["functionCall"], dict)
+            if (
+                isinstance(part, dict)
+                and "functionCall" in part
+                and isinstance(part["functionCall"], dict)
+            )
         ]
 
     # -----------------------------------------------------------------------
@@ -376,7 +660,7 @@ class GeminiProvider(AIProvider):
 
         except _TransientAIError as exc:
             raise AIProviderError(
-                "Gemini unavailable after retries",
+                "Gemini is temporarily unavailable after retries.",
                 self.name,
                 exc,
             ) from exc
@@ -391,18 +675,7 @@ class GeminiProvider(AIProvider):
         self,
         texts: list[str],
     ) -> list[list[float]]:
-        """Generate 768-dimensional embeddings for multiple texts.
-
-        Uses Gemini's batchEmbedContents endpoint with
-        gemini-embedding-001.
-
-        PersonaAI uses Vector(768), so outputDimensionality is explicitly
-        set to 768 on every embedding request.
-
-        The model is also normalized here so stale configuration containing
-        'models/' or the retired 'text-embedding-004' cannot produce the
-        previous 404 error.
-        """
+        """Generate 768-dimensional embeddings for multiple texts."""
 
         if not texts:
             return []
@@ -420,8 +693,6 @@ class GeminiProvider(AIProvider):
             self.embedding_model
         )
 
-        # Keep the provider's runtime value synchronized in case the model
-        # was normalized from an older configuration value.
         self.embedding_model = clean_model
 
         body = {
@@ -442,7 +713,8 @@ class GeminiProvider(AIProvider):
         }
 
         logger.debug(
-            "Generating %s Gemini embeddings using model=%s dimension=%s",
+            "Generating %s Gemini embeddings using "
+            "model=%s dimension=%s",
             len(clean_texts),
             clean_model,
             GEMINI_EMBEDDING_DIMENSION,
@@ -456,7 +728,8 @@ class GeminiProvider(AIProvider):
 
         except _TransientAIError as exc:
             raise AIProviderError(
-                "Gemini unavailable after retries",
+                "Gemini embedding service is temporarily unavailable "
+                "after retries.",
                 self.name,
                 exc,
             ) from exc
@@ -466,14 +739,14 @@ class GeminiProvider(AIProvider):
 
         except (KeyError, TypeError) as exc:
             raise AIProviderError(
-                f"Unexpected Gemini embedding response shape: {data}",
+                "Unexpected Gemini embedding response shape.",
                 self.name,
                 exc,
             ) from exc
 
         if not isinstance(embeddings, list):
             raise AIProviderError(
-                f"Gemini returned invalid embeddings: {data}",
+                "Gemini returned invalid embeddings.",
                 self.name,
             )
 
@@ -490,8 +763,7 @@ class GeminiProvider(AIProvider):
         for index, item in enumerate(embeddings):
             if not isinstance(item, dict) or "values" not in item:
                 raise AIProviderError(
-                    f"Gemini embedding #{index} has an invalid response: "
-                    f"{item}",
+                    f"Gemini embedding #{index} has an invalid response.",
                     self.name,
                 )
 
@@ -499,8 +771,7 @@ class GeminiProvider(AIProvider):
 
             if not isinstance(values, list):
                 raise AIProviderError(
-                    f"Gemini embedding #{index} returned invalid values: "
-                    f"{values}",
+                    f"Gemini embedding #{index} returned invalid values.",
                     self.name,
                 )
 
@@ -557,7 +828,7 @@ class GeminiProvider(AIProvider):
 
         if not labels:
             raise AIProviderError(
-                "classify() called with an empty label set",
+                "classify() called with an empty label set.",
                 self.name,
             )
 
@@ -581,19 +852,17 @@ class GeminiProvider(AIProvider):
 
         cleaned = raw.strip().strip('"').strip("'")
 
-        # Exact case-insensitive match first.
         for label in labels:
             if cleaned.lower() == label.lower():
                 return label
 
-        # Then allow a response containing the label.
         for label in labels:
             if label.lower() in cleaned.lower():
                 return label
 
         raise AIProviderError(
-            f"Gemini returned '{raw}', which doesn't match "
-            f"any of {labels}",
+            f"Gemini returned '{raw}', which does not match "
+            f"any supplied label.",
             self.name,
         )
 
@@ -607,23 +876,30 @@ class GeminiProvider(AIProvider):
         mime_type: str,
         instruction: str | None = None,
     ) -> str:
-        """Analyze an image using Gemini multimodal generation.
-
-        The image is sent as inline base64 data.
-
-        Gemini inline image data is intended for reasonably sized payloads.
-        Larger files should use the Gemini Files API instead.
-        """
+        """Analyze an image using Gemini multimodal generation."""
 
         if not image_bytes:
             raise AIProviderError(
-                "describe_image() received empty image data",
+                "describe_image() received empty image data.",
                 self.name,
             )
 
         if not mime_type:
             raise AIProviderError(
-                "describe_image() requires a MIME type",
+                "describe_image() requires a MIME type.",
+                self.name,
+            )
+
+        if not mime_type.startswith("image/"):
+            raise AIProviderError(
+                f"Unsupported image MIME type: {mime_type}",
+                self.name,
+            )
+
+        if len(image_bytes) > MAX_INLINE_IMAGE_BYTES:
+            raise AIProviderError(
+                "Image is too large for inline Gemini processing. "
+                "Use the Gemini Files API for large images.",
                 self.name,
             )
 
@@ -633,6 +909,10 @@ class GeminiProvider(AIProvider):
             "appear. Describe any products, packaging, labels, clothing, "
             "documents, or app/screenshot UI shown."
         )
+
+        encoded_image = base64.b64encode(
+            image_bytes
+        ).decode("ascii")
 
         body = {
             "contents": [
@@ -645,10 +925,8 @@ class GeminiProvider(AIProvider):
                         {
                             "inline_data": {
                                 "mime_type": mime_type,
-                                "data": base64.b64encode(
-                                    image_bytes
-                                ).decode("ascii"),
-                            }
+                                "data": encoded_image,
+                            },
                         },
                     ],
                 }
@@ -662,11 +940,21 @@ class GeminiProvider(AIProvider):
             data = await self._post(
                 f"/models/{self.model}:generateContent",
                 body,
+                max_attempts=3,
             )
 
         except _TransientAIError as exc:
+            logger.error(
+                "Gemini image analysis failed after retries: "
+                "model=%s mime_type=%s image_bytes=%s",
+                self.model,
+                mime_type,
+                len(image_bytes),
+            )
+
             raise AIProviderError(
-                "Gemini unavailable after retries",
+                "Gemini image analysis is temporarily unavailable. "
+                "Please try again shortly.",
                 self.name,
                 exc,
             ) from exc
@@ -686,13 +974,13 @@ class GeminiProvider(AIProvider):
 
         if not audio_bytes:
             raise AIProviderError(
-                "transcribe_audio() received empty audio data",
+                "transcribe_audio() received empty audio data.",
                 self.name,
             )
 
         if not mime_type:
             raise AIProviderError(
-                "transcribe_audio() requires a MIME type",
+                "transcribe_audio() requires a MIME type.",
                 self.name,
             )
 
@@ -701,6 +989,10 @@ class GeminiProvider(AIProvider):
             "original language. Output only the transcript — no preamble, "
             "no translation, no description of tone."
         )
+
+        encoded_audio = base64.b64encode(
+            audio_bytes
+        ).decode("ascii")
 
         body = {
             "contents": [
@@ -713,10 +1005,8 @@ class GeminiProvider(AIProvider):
                         {
                             "inline_data": {
                                 "mime_type": mime_type,
-                                "data": base64.b64encode(
-                                    audio_bytes
-                                ).decode("ascii"),
-                            }
+                                "data": encoded_audio,
+                            },
                         },
                     ],
                 }
@@ -730,11 +1020,13 @@ class GeminiProvider(AIProvider):
             data = await self._post(
                 f"/models/{self.model}:generateContent",
                 body,
+                max_attempts=3,
             )
 
         except _TransientAIError as exc:
             raise AIProviderError(
-                "Gemini unavailable after retries",
+                "Gemini audio transcription is temporarily "
+                "unavailable after retries.",
                 self.name,
                 exc,
             ) from exc
@@ -760,25 +1052,6 @@ class GeminiProvider(AIProvider):
         This is important for newer Gemini models where model response
         metadata, including thought signatures, may need to be preserved
         when sending the model turn back to Gemini.
-
-        Flow:
-
-            user prompt
-                ↓
-            Gemini
-                ↓
-            functionCall(s)
-                ↓
-            execute tools
-                ↓
-            functionResponse(s)
-                ↓
-            Gemini
-                ↓
-            final text
-
-        The model may execute multiple tools in one response and may
-        perform several sequential tool-calling iterations.
         """
 
         if not tools:
@@ -790,7 +1063,7 @@ class GeminiProvider(AIProvider):
 
         if max_tool_iterations < 1:
             raise AIProviderError(
-                "max_tool_iterations must be at least 1",
+                "max_tool_iterations must be at least 1.",
                 self.name,
             )
 
@@ -835,7 +1108,10 @@ class GeminiProvider(AIProvider):
             "systemInstruction": {
                 "parts": [
                     {
-                        "text": base_system_prompt + tool_guidance,
+                        "text": (
+                            base_system_prompt
+                            + tool_guidance
+                        ),
                     }
                 ]
             },
@@ -865,7 +1141,7 @@ class GeminiProvider(AIProvider):
 
             except _TransientAIError as exc:
                 raise AIProviderError(
-                    "Gemini unavailable after retries",
+                    "Gemini is temporarily unavailable after retries.",
                     self.name,
                     exc,
                 ) from exc
@@ -875,7 +1151,7 @@ class GeminiProvider(AIProvider):
             function_calls = self._extract_function_calls(parts)
 
             # ---------------------------------------------------------------
-            # Gemini returned a normal text response.
+            # Normal final text response.
             # ---------------------------------------------------------------
 
             if not function_calls:
@@ -891,11 +1167,11 @@ class GeminiProvider(AIProvider):
                         "tool iteration(s)",
                         iteration,
                     )
+
                     return text
 
                 raise AIProviderError(
-                    "Gemini returned neither text nor function calls: "
-                    f"{data}",
+                    "Gemini returned neither text nor function calls.",
                     self.name,
                 )
 
@@ -908,14 +1184,9 @@ class GeminiProvider(AIProvider):
                 ),
             )
 
-            # ---------------------------------------------------------------
-            # IMPORTANT:
-            #
-            # Preserve the complete model response exactly as Gemini sent it.
-            #
-            # This is especially important for Gemini models that return
-            # thoughtSignature metadata alongside function calls.
-            # ---------------------------------------------------------------
+            # Preserve Gemini's complete model response exactly as returned.
+            # This is important for thought signatures and other model
+            # response metadata used by newer Gemini models.
 
             contents.append(
                 {
@@ -928,9 +1199,7 @@ class GeminiProvider(AIProvider):
 
             for function_call in function_calls:
                 tool_name = function_call.get("name")
-
                 tool_args = function_call.get("args") or {}
-
                 tool_call_id = function_call.get("id")
 
                 if not tool_name:
@@ -943,16 +1212,14 @@ class GeminiProvider(AIProvider):
 
                     logger.warning(
                         "Gemini returned a function call without "
-                        "a name: %s",
-                        function_call,
+                        "a name."
                     )
 
                 else:
                     logger.info(
-                        "Executing Gemini tool name=%s id=%s args=%s",
+                        "Executing Gemini tool name=%s id=%s",
                         tool_name,
                         tool_call_id,
-                        tool_args,
                     )
 
                     try:
@@ -961,7 +1228,7 @@ class GeminiProvider(AIProvider):
                             tool_args,
                         )
 
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:
                         logger.exception(
                             "Tool execution failed for Gemini tool=%s",
                             tool_name,
@@ -976,7 +1243,6 @@ class GeminiProvider(AIProvider):
                     "response": result,
                 }
 
-                # Preserve the call ID when Gemini supplies one.
                 if tool_call_id:
                     function_response["id"] = tool_call_id
 
@@ -985,13 +1251,6 @@ class GeminiProvider(AIProvider):
                         "functionResponse": function_response,
                     }
                 )
-
-            # ---------------------------------------------------------------
-            # Send all tool results back together.
-            #
-            # We preserve the same role behavior already used by the
-            # existing PersonaAI implementation.
-            # ---------------------------------------------------------------
 
             contents.append(
                 {
@@ -1043,7 +1302,7 @@ class GeminiProvider(AIProvider):
         except _TransientAIError as exc:
             raise AIProviderError(
                 "Gemini unavailable after retries while forcing "
-                "a final tool-calling response",
+                "a final tool-calling response.",
                 self.name,
                 exc,
             ) from exc
@@ -1055,7 +1314,7 @@ class GeminiProvider(AIProvider):
             raise AIProviderError(
                 "Gemini tool-calling loop exceeded "
                 f"{max_tool_iterations} iterations without a "
-                "final answer",
+                "final answer.",
                 self.name,
                 exc,
             ) from exc
