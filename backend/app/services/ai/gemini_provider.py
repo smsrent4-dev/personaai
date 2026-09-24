@@ -15,6 +15,8 @@ Production features:
 - Multimodal image understanding
 - Audio transcription
 - 768-dimensional Gemini embeddings
+- Gemini 3.x thinking-level support
+- Low-latency settings for normal customer conversations
 """
 
 from __future__ import annotations
@@ -37,7 +39,13 @@ from app.services.ai.exceptions import (
 
 logger = logging.getLogger(__name__)
 
+
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+
+# ============================================================================
+# EMBEDDINGS
+# ============================================================================
 
 # PersonaAI's pgvector schema currently uses 768 dimensions.
 GEMINI_EMBEDDING_DIMENSION = 768
@@ -49,7 +57,11 @@ RETIRED_EMBEDDING_MODELS = {
     "models/text-embedding-004",
 }
 
-# HTTP statuses that may recover if retried.
+
+# ============================================================================
+# RETRIES
+# ============================================================================
+
 TRANSIENT_STATUS_CODES = {
     429,
     500,
@@ -58,14 +70,47 @@ TRANSIENT_STATUS_CODES = {
     504,
 }
 
-# Number of attempts for each model before moving to fallback.
+# Two attempts per model:
+#
+# attempt 1
+# attempt 2
+#
+# Then immediately move to fallback.
 MAX_RETRIES_PER_MODEL = 2
 
 INITIAL_RETRY_DELAY = 1.0
 
-MAX_RETRY_DELAY = 8.0
+MAX_RETRY_DELAY = 4.0
 
-MAX_RETRY_AFTER = 30.0
+# Do not allow Google's Retry-After header to make a customer wait forever.
+MAX_RETRY_AFTER = 8.0
+
+
+# ============================================================================
+# GEMINI 3 THINKING
+# ============================================================================
+
+# Gemini 3.8 Flash supports:
+#
+#   low
+#   medium
+#   high
+#
+# "minimal" is NOT supported by Gemini 3.8 Flash.
+#
+# PersonaAI is a customer-facing chat application, so low is the default.
+DEFAULT_THINKING_LEVEL = "low"
+
+VALID_THINKING_LEVELS = {
+    "low",
+    "medium",
+    "high",
+}
+
+
+# ============================================================================
+# INTERNAL TRANSIENT ERROR
+# ============================================================================
 
 
 class _TransientAIError(Exception):
@@ -78,8 +123,14 @@ class _TransientAIError(Exception):
         retry_after: float | None = None,
     ):
         super().__init__(message)
+
         self.status_code = status_code
         self.retry_after = retry_after
+
+
+# ============================================================================
+# PROVIDER
+# ============================================================================
 
 
 class GeminiProvider(AIProvider):
@@ -112,12 +163,13 @@ class GeminiProvider(AIProvider):
             else None
         )
 
-        # Never use the same model as both primary and fallback.
+        # Never use the same model twice.
         if self.fallback_model == self.model:
             logger.warning(
-                "GEMINI_FALLBACK_MODEL is the same as GEMINI_MODEL. "
-                "Disabling fallback."
+                "GEMINI_FALLBACK_MODEL is the same as "
+                "GEMINI_MODEL. Disabling fallback."
             )
+
             self.fallback_model = None
 
         configured_embedding_model = (
@@ -130,8 +182,10 @@ class GeminiProvider(AIProvider):
             or DEFAULT_GEMINI_EMBEDDING_MODEL
         )
 
-        self.embedding_model = self._normalize_embedding_model(
-            configured_embedding_model
+        self.embedding_model = (
+            self._normalize_embedding_model(
+                configured_embedding_model
+            )
         )
 
         self._client = httpx.AsyncClient(
@@ -148,12 +202,16 @@ class GeminiProvider(AIProvider):
             )
 
         logger.info(
-            "GeminiProvider initialized: "
-            "primary=%s fallback=%s embedding=%s dimensions=%s",
+            (
+                "GeminiProvider initialized: "
+                "primary=%s fallback=%s embedding=%s "
+                "dimensions=%s thinking=%s"
+            ),
             self.model,
             self.fallback_model or "<disabled>",
             self.embedding_model,
             GEMINI_EMBEDDING_DIMENSION,
+            DEFAULT_THINKING_LEVEL,
         )
 
     # =========================================================================
@@ -163,6 +221,7 @@ class GeminiProvider(AIProvider):
     @staticmethod
     def _clean_model_name(model: str) -> str:
         """Remove optional models/ prefix."""
+
         return model.strip().removeprefix("models/")
 
     @classmethod
@@ -176,8 +235,10 @@ class GeminiProvider(AIProvider):
 
         if clean_model in RETIRED_EMBEDDING_MODELS:
             logger.warning(
-                "Embedding model '%s' is retired. "
-                "Using '%s' instead.",
+                (
+                    "Embedding model '%s' is retired. "
+                    "Using '%s' instead."
+                ),
                 model,
                 DEFAULT_GEMINI_EMBEDDING_MODEL,
             )
@@ -185,6 +246,43 @@ class GeminiProvider(AIProvider):
             return DEFAULT_GEMINI_EMBEDDING_MODEL
 
         return clean_model
+
+    @staticmethod
+    def _normalize_thinking_level(
+        thinking_level: str | None,
+    ) -> str:
+        """Validate Gemini 3 thinking level."""
+
+        level = (
+            thinking_level
+            or DEFAULT_THINKING_LEVEL
+        ).strip().lower()
+
+        if level not in VALID_THINKING_LEVELS:
+            logger.warning(
+                (
+                    "Invalid Gemini thinking level '%s'. "
+                    "Using '%s'."
+                ),
+                thinking_level,
+                DEFAULT_THINKING_LEVEL,
+            )
+
+            return DEFAULT_THINKING_LEVEL
+
+        return level
+
+    def _is_gemini_3_model(
+        self,
+        model: str | None = None,
+    ) -> bool:
+        """Return whether the model is a Gemini 3.x model."""
+
+        target = self._clean_model_name(
+            model or self.model
+        )
+
+        return target.startswith("gemini-3.")
 
     # =========================================================================
     # RETRY HELPERS
@@ -196,7 +294,9 @@ class GeminiProvider(AIProvider):
     ) -> float | None:
         """Read Retry-After header if Gemini provides one."""
 
-        value = response.headers.get("Retry-After")
+        value = response.headers.get(
+            "Retry-After"
+        )
 
         if not value:
             return None
@@ -207,19 +307,27 @@ class GeminiProvider(AIProvider):
             if seconds < 0:
                 return None
 
-            return min(seconds, MAX_RETRY_AFTER)
+            return min(
+                seconds,
+                MAX_RETRY_AFTER,
+            )
 
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             return None
 
     @staticmethod
     def _calculate_backoff(
         attempt: int,
     ) -> float:
-        """Exponential backoff with small jitter."""
+        """Exponential backoff with jitter."""
 
         base_delay = min(
-            INITIAL_RETRY_DELAY * (2 ** (attempt - 1)),
+            INITIAL_RETRY_DELAY * (
+                2 ** (attempt - 1)
+            ),
             MAX_RETRY_DELAY,
         )
 
@@ -276,7 +384,10 @@ class GeminiProvider(AIProvider):
                 )
 
                 logger.warning(
-                    "Gemini timeout attempt=%s/%s path=%s",
+                    (
+                        "Gemini timeout "
+                        "attempt=%s/%s path=%s"
+                    ),
                     attempt,
                     MAX_RETRIES_PER_MODEL,
                     path,
@@ -288,7 +399,10 @@ class GeminiProvider(AIProvider):
                 )
 
                 logger.warning(
-                    "Gemini transport error attempt=%s/%s path=%s error=%s",
+                    (
+                        "Gemini transport error "
+                        "attempt=%s/%s path=%s error=%s"
+                    ),
                     attempt,
                     MAX_RETRIES_PER_MODEL,
                     path,
@@ -304,8 +418,10 @@ class GeminiProvider(AIProvider):
 
                 if status in (401, 403):
                     raise AIAuthenticationError(
-                        "Gemini API key is invalid, missing, "
-                        "or not authorized for this request.",
+                        (
+                            "Gemini API key is invalid, missing, "
+                            "or not authorized for this request."
+                        ),
                         self.name,
                     )
 
@@ -314,17 +430,26 @@ class GeminiProvider(AIProvider):
                 # -------------------------------------------------------------
 
                 if status == 429:
-                    retry_after = self._parse_retry_after(response)
+                    retry_after = (
+                        self._parse_retry_after(
+                            response
+                        )
+                    )
 
                     last_error = _TransientAIError(
-                        f"Gemini rate limit exceeded: {response.text}",
+                        (
+                            "Gemini rate limit exceeded: "
+                            f"{response.text}"
+                        ),
                         status_code=429,
                         retry_after=retry_after,
                     )
 
                     logger.warning(
-                        "Gemini rate limit "
-                        "attempt=%s/%s retry_after=%s",
+                        (
+                            "Gemini rate limit "
+                            "attempt=%s/%s retry_after=%s"
+                        ),
                         attempt,
                         MAX_RETRIES_PER_MODEL,
                         retry_after,
@@ -341,13 +466,18 @@ class GeminiProvider(AIProvider):
                     504,
                 }:
                     last_error = _TransientAIError(
-                        f"Gemini returned {status}: {response.text}",
+                        (
+                            f"Gemini returned {status}: "
+                            f"{response.text}"
+                        ),
                         status_code=status,
                     )
 
                     logger.warning(
-                        "Gemini transient error "
-                        "attempt=%s/%s status=%s path=%s",
+                        (
+                            "Gemini transient error "
+                            "attempt=%s/%s status=%s path=%s"
+                        ),
                         attempt,
                         MAX_RETRIES_PER_MODEL,
                         status,
@@ -355,13 +485,15 @@ class GeminiProvider(AIProvider):
                     )
 
                 # -------------------------------------------------------------
-                # CLIENT ERROR
+                # OTHER CLIENT ERROR
                 # -------------------------------------------------------------
 
                 elif status >= 400:
                     raise AIProviderError(
-                        f"Gemini request failed ({status}): "
-                        f"{response.text}",
+                        (
+                            f"Gemini request failed ({status}): "
+                            f"{response.text}"
+                        ),
                         self.name,
                     )
 
@@ -393,11 +525,15 @@ class GeminiProvider(AIProvider):
             if last_error.retry_after is not None:
                 delay = last_error.retry_after
             else:
-                delay = self._calculate_backoff(attempt)
+                delay = self._calculate_backoff(
+                    attempt
+                )
 
             logger.info(
-                "Retrying Gemini request in %.2fs "
-                "(attempt %s/%s)",
+                (
+                    "Retrying Gemini request in %.2fs "
+                    "(attempt %s/%s)"
+                ),
                 delay,
                 attempt + 1,
                 MAX_RETRIES_PER_MODEL,
@@ -421,25 +557,7 @@ class GeminiProvider(AIProvider):
         self,
         body: dict[str, Any],
     ) -> dict[str, Any]:
-        """Generate content using primary model and optional fallback.
-
-        Flow:
-
-            Primary
-                ↓
-            transient error
-                ↓
-            retry
-                ↓
-            transient error
-                ↓
-            fallback
-                ↓
-            success
-
-        Non-transient errors such as authentication failures are not
-        silently sent to another model.
-        """
+        """Generate content using primary and optional fallback model."""
 
         models: list[str] = [
             self.model,
@@ -460,7 +578,10 @@ class GeminiProvider(AIProvider):
             )
 
             logger.info(
-                "Gemini generation request model=%s fallback=%s",
+                (
+                    "Gemini generation request "
+                    "model=%s fallback=%s"
+                ),
                 model,
                 is_fallback,
             )
@@ -475,33 +596,43 @@ class GeminiProvider(AIProvider):
                 last_error = exc
 
                 logger.warning(
-                    "Gemini model unavailable "
-                    "model=%s fallback=%s status=%s",
+                    (
+                        "Gemini model unavailable "
+                        "model=%s fallback=%s status=%s"
+                    ),
                     model,
                     is_fallback,
                     exc.status_code,
                 )
 
                 # -------------------------------------------------------------
-                # FALLBACK AVAILABLE
+                # PRIMARY FAILED -> FALLBACK
                 # -------------------------------------------------------------
 
-                if not is_fallback and self.fallback_model:
+                if (
+                    not is_fallback
+                    and self.fallback_model
+                ):
                     logger.warning(
-                        "Primary Gemini model failed after retries. "
-                        "Switching to fallback model=%s",
+                        (
+                            "Primary Gemini model failed "
+                            "after retries. Switching to "
+                            "fallback model=%s"
+                        ),
                         self.fallback_model,
                     )
 
                     continue
 
                 # -------------------------------------------------------------
-                # NO FALLBACK
+                # FALLBACK FAILED
                 # -------------------------------------------------------------
 
                 logger.error(
-                    "Gemini model failed and no usable fallback "
-                    "is configured. model=%s status=%s",
+                    (
+                        "Gemini model failed and no usable "
+                        "fallback remains. model=%s status=%s"
+                    ),
                     model,
                     exc.status_code,
                 )
@@ -513,7 +644,7 @@ class GeminiProvider(AIProvider):
                 raise
 
         # ---------------------------------------------------------------------
-        # FINAL ERROR
+        # FINAL TRANSIENT ERROR
         # ---------------------------------------------------------------------
 
         if isinstance(
@@ -522,16 +653,22 @@ class GeminiProvider(AIProvider):
         ):
             if last_error.status_code == 429:
                 raise AIRateLimitError(
-                    "Gemini rate limit exceeded after retries.",
+                    (
+                        "Gemini rate limit exceeded "
+                        "after retries and fallback."
+                    ),
                     self.name,
                 ) from last_error
 
             raise AIProviderError(
-                "Gemini is temporarily unavailable after retries"
-                + (
-                    " and the fallback model also failed."
-                    if self.fallback_model
-                    else "."
+                (
+                    "Gemini is temporarily unavailable "
+                    "after retries"
+                    + (
+                        " and the fallback model also failed."
+                        if self.fallback_model
+                        else "."
+                    )
                 ),
                 self.name,
                 last_error,
@@ -541,6 +678,47 @@ class GeminiProvider(AIProvider):
             "Gemini generation failed.",
             self.name,
         )
+
+    # =========================================================================
+    # GENERATION CONFIG
+    # =========================================================================
+
+    def _build_generation_config(
+        self,
+        *,
+        model: str,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        thinking_level: str | None = None,
+    ) -> dict[str, Any]:
+        """Build Gemini generation configuration.
+
+        Gemini 3.x:
+            - Do NOT send temperature.
+            - Use thinkingConfig.thinkingLevel.
+
+        Older Gemini models:
+            - Temperature remains supported.
+        """
+
+        config: dict[str, Any] = {}
+
+        if max_tokens is not None:
+            config["maxOutputTokens"] = max_tokens
+
+        if self._is_gemini_3_model(model):
+            level = self._normalize_thinking_level(
+                thinking_level
+            )
+
+            config["thinkingConfig"] = {
+                "thinkingLevel": level,
+            }
+
+        elif temperature is not None:
+            config["temperature"] = temperature
+
+        return config
 
     # =========================================================================
     # RESPONSE EXTRACTION
@@ -557,8 +735,11 @@ class GeminiProvider(AIProvider):
 
             if not candidates:
                 raise AIProviderError(
-                    "Gemini returned no candidates. "
-                    "The response may have been blocked by safety filters.",
+                    (
+                        "Gemini returned no candidates. "
+                        "The response may have been blocked "
+                        "by safety filters."
+                    ),
                     "gemini",
                 )
 
@@ -572,7 +753,10 @@ class GeminiProvider(AIProvider):
 
             if not text:
                 raise AIProviderError(
-                    f"Gemini returned no text content: {data}",
+                    (
+                        "Gemini returned no text content: "
+                        f"{data}"
+                    ),
                     "gemini",
                 )
 
@@ -587,7 +771,10 @@ class GeminiProvider(AIProvider):
             TypeError,
         ) as exc:
             raise AIProviderError(
-                f"Unexpected Gemini response shape: {data}",
+                (
+                    "Unexpected Gemini response shape: "
+                    f"{data}"
+                ),
                 "gemini",
                 exc,
             ) from exc
@@ -596,7 +783,7 @@ class GeminiProvider(AIProvider):
     def _extract_candidate_parts(
         data: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Extract all response parts from Gemini's first candidate."""
+        """Extract all response parts from first candidate."""
 
         try:
             candidates = data["candidates"]
@@ -609,9 +796,15 @@ class GeminiProvider(AIProvider):
 
             parts = candidates[0]["content"]["parts"]
 
-            if not isinstance(parts, list):
+            if not isinstance(
+                parts,
+                list,
+            ):
                 raise AIProviderError(
-                    f"Gemini returned invalid parts: {parts}",
+                    (
+                        "Gemini returned invalid parts: "
+                        f"{parts}"
+                    ),
                     "gemini",
                 )
 
@@ -626,7 +819,10 @@ class GeminiProvider(AIProvider):
             TypeError,
         ) as exc:
             raise AIProviderError(
-                f"Unexpected Gemini tool response shape: {data}",
+                (
+                    "Unexpected Gemini tool response "
+                    f"shape: {data}"
+                ),
                 "gemini",
                 exc,
             ) from exc
@@ -660,8 +856,13 @@ class GeminiProvider(AIProvider):
         temperature: float = 0.7,
         max_tokens: int | None = None,
     ) -> str:
-        """Generate text with Gemini."""
+        """Generate normal customer-facing text."""
 
+        # Gemini 3.x ignores the old temperature concept and uses thinking
+        # level instead.
+        #
+        # We intentionally use LOW here because PersonaAI is a real-time
+        # customer conversation system.
         body: dict[str, Any] = {
             "contents": [
                 {
@@ -672,16 +873,8 @@ class GeminiProvider(AIProvider):
                         }
                     ],
                 }
-            ],
-            "generationConfig": {
-                "temperature": temperature,
-            },
+            ]
         }
-
-        if max_tokens is not None:
-            body["generationConfig"][
-                "maxOutputTokens"
-            ] = max_tokens
 
         if system_instruction:
             body["systemInstruction"] = {
@@ -691,6 +884,21 @@ class GeminiProvider(AIProvider):
                     }
                 ]
             }
+
+        # The body must be generated separately for each model because
+        # primary/fallback models may have different generation semantics.
+        #
+        # `_generate_content_with_fallback()` receives the same body, so use
+        # a configuration that is valid for Gemini 3.x, which is the current
+        # PersonaAI production configuration.
+        body["generationConfig"] = (
+            self._build_generation_config(
+                model=self.model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                thinking_level="low",
+            )
+        )
 
         data = await self._generate_content_with_fallback(
             body
@@ -749,8 +957,10 @@ class GeminiProvider(AIProvider):
         }
 
         logger.debug(
-            "Generating Gemini embeddings "
-            "count=%s model=%s dimensions=%s",
+            (
+                "Generating Gemini embeddings "
+                "count=%s model=%s dimensions=%s"
+            ),
             len(clean_texts),
             self.embedding_model,
             GEMINI_EMBEDDING_DIMENSION,
@@ -773,7 +983,10 @@ class GeminiProvider(AIProvider):
                 ) from exc
 
             raise AIProviderError(
-                "Gemini embedding service is temporarily unavailable.",
+                (
+                    "Gemini embedding service is "
+                    "temporarily unavailable."
+                ),
                 self.name,
                 exc,
             ) from exc
@@ -786,7 +999,10 @@ class GeminiProvider(AIProvider):
             TypeError,
         ) as exc:
             raise AIProviderError(
-                f"Unexpected Gemini embedding response: {data}",
+                (
+                    "Unexpected Gemini embedding "
+                    f"response: {data}"
+                ),
                 self.name,
                 exc,
             ) from exc
@@ -800,24 +1016,33 @@ class GeminiProvider(AIProvider):
                 self.name,
             )
 
-        if len(embeddings) != len(clean_texts):
+        if len(embeddings) != len(
+            clean_texts
+        ):
             raise AIProviderError(
-                "Gemini returned a different number of "
-                f"embeddings than inputs. "
-                f"inputs={len(clean_texts)}, "
-                f"embeddings={len(embeddings)}",
+                (
+                    "Gemini returned a different number "
+                    "of embeddings than inputs. "
+                    f"inputs={len(clean_texts)}, "
+                    f"embeddings={len(embeddings)}"
+                ),
                 self.name,
             )
 
         vectors: list[list[float]] = []
 
-        for index, item in enumerate(embeddings):
+        for index, item in enumerate(
+            embeddings
+        ):
             if (
                 not isinstance(item, dict)
                 or "values" not in item
             ):
                 raise AIProviderError(
-                    f"Invalid Gemini embedding #{index}: {item}",
+                    (
+                        f"Invalid Gemini embedding "
+                        f"#{index}: {item}"
+                    ),
                     self.name,
                 )
 
@@ -828,15 +1053,23 @@ class GeminiProvider(AIProvider):
                 list,
             ):
                 raise AIProviderError(
-                    f"Invalid embedding values #{index}: {values}",
+                    (
+                        f"Invalid embedding values "
+                        f"#{index}: {values}"
+                    ),
                     self.name,
                 )
 
-            if len(values) != GEMINI_EMBEDDING_DIMENSION:
+            if len(values) != (
+                GEMINI_EMBEDDING_DIMENSION
+            ):
                 raise AIProviderError(
-                    f"Gemini embedding #{index} returned "
-                    f"{len(values)} dimensions; expected "
-                    f"{GEMINI_EMBEDDING_DIMENSION}.",
+                    (
+                        f"Gemini embedding #{index} "
+                        f"returned {len(values)} "
+                        "dimensions; expected "
+                        f"{GEMINI_EMBEDDING_DIMENSION}."
+                    ),
                     self.name,
                 )
 
@@ -856,7 +1089,9 @@ class GeminiProvider(AIProvider):
         """Summarize text."""
 
         constraint = (
-            f" in no more than {max_words} words"
+            (
+                f" in no more than {max_words} words"
+            )
             if max_words
             else " concisely"
         )
@@ -885,7 +1120,10 @@ class GeminiProvider(AIProvider):
 
         if not labels:
             raise AIProviderError(
-                "classify() received an empty label set.",
+                (
+                    "classify() received an empty "
+                    "label set."
+                ),
                 self.name,
             )
 
@@ -895,8 +1133,8 @@ class GeminiProvider(AIProvider):
         )
 
         prompt = (
-            "Classify the following text into exactly one "
-            "of these categories.\n\n"
+            "Classify the following text into exactly "
+            "one of these categories.\n\n"
             "Respond with only the category name exactly "
             "as written.\n\n"
             f"Categories:\n{label_list}\n\n"
@@ -924,8 +1162,11 @@ class GeminiProvider(AIProvider):
                 return label
 
         raise AIProviderError(
-            f"Gemini returned '{raw}', which does not "
-            f"match any supplied label: {labels}",
+            (
+                f"Gemini returned '{raw}', which does "
+                "not match any supplied label: "
+                f"{labels}"
+            ),
             self.name,
         )
 
@@ -943,13 +1184,19 @@ class GeminiProvider(AIProvider):
 
         if not image_bytes:
             raise AIProviderError(
-                "describe_image() received empty image data.",
+                (
+                    "describe_image() received "
+                    "empty image data."
+                ),
                 self.name,
             )
 
         if not mime_type:
             raise AIProviderError(
-                "describe_image() requires a MIME type.",
+                (
+                    "describe_image() requires "
+                    "a MIME type."
+                ),
                 self.name,
             )
 
@@ -972,21 +1219,29 @@ class GeminiProvider(AIProvider):
                         {
                             "inline_data": {
                                 "mime_type": mime_type,
-                                "data": base64.b64encode(
-                                    image_bytes
-                                ).decode("ascii"),
+                                "data": (
+                                    base64.b64encode(
+                                        image_bytes
+                                    ).decode("ascii")
+                                ),
                             },
                         },
                     ],
                 }
             ],
-            "generationConfig": {
-                "temperature": 0.2,
-            },
+            "generationConfig": (
+                self._build_generation_config(
+                    model=self.model,
+                    temperature=0.2,
+                    thinking_level="low",
+                )
+            ),
         }
 
-        data = await self._generate_content_with_fallback(
-            body
+        data = (
+            await self._generate_content_with_fallback(
+                body
+            )
         )
 
         return self._extract_text(data)
@@ -1004,13 +1259,19 @@ class GeminiProvider(AIProvider):
 
         if not audio_bytes:
             raise AIProviderError(
-                "transcribe_audio() received empty audio data.",
+                (
+                    "transcribe_audio() received "
+                    "empty audio data."
+                ),
                 self.name,
             )
 
         if not mime_type:
             raise AIProviderError(
-                "transcribe_audio() requires a MIME type.",
+                (
+                    "transcribe_audio() requires "
+                    "a MIME type."
+                ),
                 self.name,
             )
 
@@ -1030,21 +1291,29 @@ class GeminiProvider(AIProvider):
                         {
                             "inline_data": {
                                 "mime_type": mime_type,
-                                "data": base64.b64encode(
-                                    audio_bytes
-                                ).decode("ascii"),
+                                "data": (
+                                    base64.b64encode(
+                                        audio_bytes
+                                    ).decode("ascii")
+                                ),
                             },
                         },
                     ],
                 }
             ],
-            "generationConfig": {
-                "temperature": 0.0,
-            },
+            "generationConfig": (
+                self._build_generation_config(
+                    model=self.model,
+                    temperature=0.0,
+                    thinking_level="low",
+                )
+            ),
         }
 
-        data = await self._generate_content_with_fallback(
-            body
+        data = (
+            await self._generate_content_with_fallback(
+                body
+            )
         )
 
         return self._extract_text(data)
@@ -1073,7 +1342,10 @@ class GeminiProvider(AIProvider):
 
         if max_tool_iterations < 1:
             raise AIProviderError(
-                "max_tool_iterations must be at least 1.",
+                (
+                    "max_tool_iterations must "
+                    "be at least 1."
+                ),
                 self.name,
             )
 
@@ -1102,33 +1374,16 @@ class GeminiProvider(AIProvider):
         )
 
         tool_guidance = (
-            "\n\nAfter using tools and receiving their results, "
+            "\n\n"
+            "After using tools and receiving their results, "
             "produce a natural final answer for the user. "
             "Do not expose internal tool execution details."
         )
 
-        body_base: dict[str, Any] = {
-            "generationConfig": {
-                "temperature": temperature,
-            },
-            "tools": [
-                {
-                    "functionDeclarations": (
-                        function_declarations
-                    ),
-                }
-            ],
-            "systemInstruction": {
-                "parts": [
-                    {
-                        "text": (
-                            base_system_prompt
-                            + tool_guidance
-                        ),
-                    }
-                ],
-            },
-        }
+        system_text = (
+            base_system_prompt
+            + tool_guidance
+        )
 
         for iteration in range(
             1,
@@ -1140,9 +1395,33 @@ class GeminiProvider(AIProvider):
                 max_tool_iterations,
             )
 
-            body = {
-                **body_base,
+            generation_config = (
+                self._build_generation_config(
+                    model=self.model,
+                    temperature=temperature,
+                    thinking_level="low",
+                )
+            )
+
+            body: dict[str, Any] = {
                 "contents": contents,
+                "generationConfig": (
+                    generation_config
+                ),
+                "tools": [
+                    {
+                        "functionDeclarations": (
+                            function_declarations
+                        ),
+                    }
+                ],
+                "systemInstruction": {
+                    "parts": [
+                        {
+                            "text": system_text,
+                        }
+                    ],
+                },
             }
 
             data = (
@@ -1152,11 +1431,15 @@ class GeminiProvider(AIProvider):
             )
 
             parts = (
-                self._extract_candidate_parts(data)
+                self._extract_candidate_parts(
+                    data
+                )
             )
 
             function_calls = (
-                self._extract_function_calls(parts)
+                self._extract_function_calls(
+                    parts
+                )
             )
 
             # ---------------------------------------------------------------
@@ -1172,27 +1455,33 @@ class GeminiProvider(AIProvider):
 
                 if text:
                     logger.info(
-                        "Gemini produced final response "
-                        "after %s tool iteration(s).",
+                        (
+                            "Gemini produced final "
+                            "response after %s "
+                            "tool iteration(s)."
+                        ),
                         iteration,
                     )
 
                     return text
 
                 raise AIProviderError(
-                    "Gemini returned neither text nor function calls.",
+                    (
+                        "Gemini returned neither "
+                        "text nor function calls."
+                    ),
                     self.name,
                 )
 
-            # ----------------------------------------------------------------
+            # ---------------------------------------------------------------
             # IMPORTANT:
             #
             # Preserve the ENTIRE model parts array.
             #
-            # This is important for Gemini responses containing thought
-            # signatures or other response metadata associated with tool
-            # calls.
-            # ----------------------------------------------------------------
+            # Gemini 3 models can return thought signatures associated with
+            # tool calls. Removing or reconstructing these parts incorrectly
+            # can break subsequent turns.
+            # ---------------------------------------------------------------
 
             contents.append(
                 {
@@ -1215,8 +1504,11 @@ class GeminiProvider(AIProvider):
                     or {}
                 )
 
-                tool_call_id = function_call.get(
-                    "id"
+                # Gemini generateContent function calling
+                # may provide a call ID. Preserve it.
+                tool_call_id = (
+                    function_call.get("id")
+                    or function_call.get("call_id")
                 )
 
                 if not tool_name:
@@ -1228,14 +1520,19 @@ class GeminiProvider(AIProvider):
                     }
 
                     logger.warning(
-                        "Gemini returned function call "
-                        "without name: %s",
+                        (
+                            "Gemini returned function "
+                            "call without name: %s"
+                        ),
                         function_call,
                     )
 
                 else:
                     logger.info(
-                        "Executing Gemini tool=%s id=%s",
+                        (
+                            "Executing Gemini tool=%s "
+                            "id=%s"
+                        ),
                         tool_name,
                         tool_call_id,
                     )
@@ -1256,7 +1553,10 @@ class GeminiProvider(AIProvider):
                             "error": str(exc),
                         }
 
-                function_response: dict[str, Any] = {
+                function_response: dict[
+                    str,
+                    Any,
+                ] = {
                     "name": (
                         tool_name
                         or "unknown"
@@ -1264,8 +1564,10 @@ class GeminiProvider(AIProvider):
                     "response": result,
                 }
 
+                # Gemini's current function-calling format expects the call
+                # identifier to be preserved when one is returned.
                 if tool_call_id:
-                    function_response["id"] = (
+                    function_response["call_id"] = (
                         tool_call_id
                     )
 
@@ -1289,8 +1591,10 @@ class GeminiProvider(AIProvider):
         # =====================================================================
 
         logger.warning(
-            "Gemini reached maximum tool iterations=%s. "
-            "Forcing final response.",
+            (
+                "Gemini reached maximum tool "
+                "iterations=%s. Forcing final response."
+            ),
             max_tool_iterations,
         )
 
@@ -1310,11 +1614,15 @@ class GeminiProvider(AIProvider):
             }
         ]
 
-        forced_body = {
-            "generationConfig": {
-                "temperature": temperature,
-            },
+        forced_body: dict[str, Any] = {
             "contents": forced_contents,
+            "generationConfig": (
+                self._build_generation_config(
+                    model=self.model,
+                    temperature=temperature,
+                    thinking_level="low",
+                )
+            ),
         }
 
         data = (
