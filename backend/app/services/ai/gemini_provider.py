@@ -17,6 +17,7 @@ Production features:
 - 768-dimensional Gemini embeddings
 - Gemini 3.x thinking-level support
 - Low-latency settings for normal customer conversations
+- API key sent through secure request headers
 """
 
 from __future__ import annotations
@@ -79,10 +80,9 @@ TRANSIENT_STATUS_CODES = {
 MAX_RETRIES_PER_MODEL = 2
 
 INITIAL_RETRY_DELAY = 1.0
-
 MAX_RETRY_DELAY = 4.0
 
-# Do not allow Google's Retry-After header to make a customer wait forever.
+# Never allow Retry-After to block a customer request for an excessive time.
 MAX_RETRY_AFTER = 8.0
 
 
@@ -90,15 +90,14 @@ MAX_RETRY_AFTER = 8.0
 # GEMINI 3 THINKING
 # ============================================================================
 
-# Gemini 3.8 Flash supports:
+# Gemini 3.x supports:
 #
 #   low
 #   medium
 #   high
 #
-# "minimal" is NOT supported by Gemini 3.8 Flash.
-#
-# PersonaAI is a customer-facing chat application, so low is the default.
+# PersonaAI is a real-time customer conversation system, so LOW is the
+# default. This keeps latency and token consumption under control.
 DEFAULT_THINKING_LEVEL = "low"
 
 VALID_THINKING_LEVELS = {
@@ -169,7 +168,6 @@ class GeminiProvider(AIProvider):
                 "GEMINI_FALLBACK_MODEL is the same as "
                 "GEMINI_MODEL. Disabling fallback."
             )
-
             self.fallback_model = None
 
         configured_embedding_model = (
@@ -182,10 +180,8 @@ class GeminiProvider(AIProvider):
             or DEFAULT_GEMINI_EMBEDDING_MODEL
         )
 
-        self.embedding_model = (
-            self._normalize_embedding_model(
-                configured_embedding_model
-            )
+        self.embedding_model = self._normalize_embedding_model(
+            configured_embedding_model
         )
 
         self._client = httpx.AsyncClient(
@@ -251,11 +247,10 @@ class GeminiProvider(AIProvider):
     def _normalize_thinking_level(
         thinking_level: str | None,
     ) -> str:
-        """Validate Gemini 3 thinking level."""
+        """Validate Gemini 3.x thinking level."""
 
         level = (
-            thinking_level
-            or DEFAULT_THINKING_LEVEL
+            thinking_level or DEFAULT_THINKING_LEVEL
         ).strip().lower()
 
         if level not in VALID_THINKING_LEVELS:
@@ -272,17 +267,15 @@ class GeminiProvider(AIProvider):
 
         return level
 
+    @staticmethod
     def _is_gemini_3_model(
-        self,
-        model: str | None = None,
+        model: str,
     ) -> bool:
-        """Return whether the model is a Gemini 3.x model."""
+        """Return whether the supplied model is Gemini 3.x."""
 
-        target = self._clean_model_name(
-            model or self.model
-        )
+        clean_model = model.strip().removeprefix("models/")
 
-        return target.startswith("gemini-3.")
+        return clean_model.startswith("gemini-3.")
 
     # =========================================================================
     # RETRY HELPERS
@@ -294,9 +287,7 @@ class GeminiProvider(AIProvider):
     ) -> float | None:
         """Read Retry-After header if Gemini provides one."""
 
-        value = response.headers.get(
-            "Retry-After"
-        )
+        value = response.headers.get("Retry-After")
 
         if not value:
             return None
@@ -312,22 +303,17 @@ class GeminiProvider(AIProvider):
                 MAX_RETRY_AFTER,
             )
 
-        except (
-            TypeError,
-            ValueError,
-        ):
+        except (TypeError, ValueError):
             return None
 
     @staticmethod
     def _calculate_backoff(
         attempt: int,
     ) -> float:
-        """Exponential backoff with jitter."""
+        """Calculate exponential backoff with jitter."""
 
         base_delay = min(
-            INITIAL_RETRY_DELAY * (
-                2 ** (attempt - 1)
-            ),
+            INITIAL_RETRY_DELAY * (2 ** (attempt - 1)),
             MAX_RETRY_DELAY,
         )
 
@@ -346,7 +332,7 @@ class GeminiProvider(AIProvider):
     # =========================================================================
 
     async def aclose(self) -> None:
-        """Close HTTP client."""
+        """Close the HTTP client."""
 
         await self._client.aclose()
 
@@ -355,7 +341,15 @@ class GeminiProvider(AIProvider):
         path: str,
         json_body: dict[str, Any],
     ) -> dict[str, Any]:
-        """POST request to Gemini with transient retry handling."""
+        """POST request to Gemini with production retry handling.
+
+        Important:
+        The API key is deliberately sent using the x-goog-api-key header
+        instead of a ?key= query parameter.
+
+        This prevents the secret from appearing in HTTP request URLs and
+        therefore reduces the chance of it being leaked into logs.
+        """
 
         if not self.api_key:
             raise AIAuthenticationError(
@@ -363,18 +357,23 @@ class GeminiProvider(AIProvider):
                 self.name,
             )
 
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
+
         last_error: _TransientAIError | None = None
 
         for attempt in range(
             1,
             MAX_RETRIES_PER_MODEL + 1,
         ):
+            last_error = None
+
             try:
                 response = await self._client.post(
                     path,
-                    params={
-                        "key": self.api_key,
-                    },
+                    headers=headers,
                     json=json_body,
                 )
 
@@ -413,6 +412,21 @@ class GeminiProvider(AIProvider):
                 status = response.status_code
 
                 # -------------------------------------------------------------
+                # SUCCESS
+                # -------------------------------------------------------------
+
+                if 200 <= status < 300:
+                    try:
+                        return response.json()
+
+                    except ValueError as exc:
+                        raise AIProviderError(
+                            "Gemini returned invalid JSON.",
+                            self.name,
+                            exc,
+                        ) from exc
+
+                # -------------------------------------------------------------
                 # AUTHENTICATION
                 # -------------------------------------------------------------
 
@@ -430,10 +444,8 @@ class GeminiProvider(AIProvider):
                 # -------------------------------------------------------------
 
                 if status == 429:
-                    retry_after = (
-                        self._parse_retry_after(
-                            response
-                        )
+                    retry_after = self._parse_retry_after(
+                        response
                     )
 
                     last_error = _TransientAIError(
@@ -448,11 +460,12 @@ class GeminiProvider(AIProvider):
                     logger.warning(
                         (
                             "Gemini rate limit "
-                            "attempt=%s/%s retry_after=%s"
+                            "attempt=%s/%s retry_after=%s path=%s"
                         ),
                         attempt,
                         MAX_RETRIES_PER_MODEL,
                         retry_after,
+                        path,
                     )
 
                 # -------------------------------------------------------------
@@ -485,7 +498,7 @@ class GeminiProvider(AIProvider):
                     )
 
                 # -------------------------------------------------------------
-                # OTHER CLIENT ERROR
+                # OTHER CLIENT/SERVER ERROR
                 # -------------------------------------------------------------
 
                 elif status >= 400:
@@ -497,27 +510,21 @@ class GeminiProvider(AIProvider):
                         self.name,
                     )
 
-                # -------------------------------------------------------------
-                # SUCCESS
-                # -------------------------------------------------------------
-
                 else:
-                    try:
-                        return response.json()
-
-                    except ValueError as exc:
-                        raise AIProviderError(
-                            "Gemini returned invalid JSON.",
-                            self.name,
-                            exc,
-                        ) from exc
+                    raise AIProviderError(
+                        (
+                            f"Unexpected Gemini HTTP status "
+                            f"{status}: {response.text}"
+                        ),
+                        self.name,
+                    )
 
             # -----------------------------------------------------------------
             # RETRY
             # -----------------------------------------------------------------
 
             if last_error is None:
-                break
+                continue
 
             if attempt >= MAX_RETRIES_PER_MODEL:
                 break
@@ -559,14 +566,10 @@ class GeminiProvider(AIProvider):
     ) -> dict[str, Any]:
         """Generate content using primary and optional fallback model."""
 
-        models: list[str] = [
-            self.model,
-        ]
+        models: list[str] = [self.model]
 
         if self.fallback_model:
-            models.append(
-                self.fallback_model
-            )
+            models.append(self.fallback_model)
 
         last_error: Exception | None = None
 
@@ -587,9 +590,48 @@ class GeminiProvider(AIProvider):
             )
 
             try:
+                # -------------------------------------------------------------
+                # Make a shallow copy so one model's generation configuration
+                # cannot accidentally mutate the next model's request.
+                # -------------------------------------------------------------
+
+                model_body = dict(body)
+
+                original_generation_config = body.get(
+                    "generationConfig"
+                )
+
+                if isinstance(
+                    original_generation_config,
+                    dict,
+                ):
+                    generation_config = dict(
+                        original_generation_config
+                    )
+
+                    # Gemini 3.x does not use the old temperature parameter.
+                    if self._is_gemini_3_model(model):
+                        generation_config.pop(
+                            "temperature",
+                            None,
+                        )
+
+                        if "thinkingConfig" not in generation_config:
+                            generation_config[
+                                "thinkingConfig"
+                            ] = {
+                                "thinkingLevel": (
+                                    DEFAULT_THINKING_LEVEL
+                                )
+                            }
+
+                    model_body["generationConfig"] = (
+                        generation_config
+                    )
+
                 return await self._post(
                     request_path,
-                    body,
+                    model_body,
                 )
 
             except _TransientAIError as exc:
@@ -694,7 +736,7 @@ class GeminiProvider(AIProvider):
         """Build Gemini generation configuration.
 
         Gemini 3.x:
-            - Do NOT send temperature.
+            - Do not send temperature.
             - Use thinkingConfig.thinkingLevel.
 
         Older Gemini models:
@@ -743,19 +785,48 @@ class GeminiProvider(AIProvider):
                     "gemini",
                 )
 
-            parts = candidates[0]["content"]["parts"]
+            content = candidates[0].get(
+                "content",
+                {},
+            )
+
+            parts = content.get(
+                "parts",
+                [],
+            )
+
+            if not isinstance(
+                parts,
+                list,
+            ):
+                raise AIProviderError(
+                    (
+                        "Gemini returned invalid content "
+                        f"parts: {parts}"
+                    ),
+                    "gemini",
+                )
 
             text = "".join(
                 part.get("text", "")
                 for part in parts
                 if isinstance(part, dict)
+                and isinstance(
+                    part.get("text"),
+                    str,
+                )
             ).strip()
 
             if not text:
+                finish_reason = candidates[0].get(
+                    "finishReason"
+                )
+
                 raise AIProviderError(
                     (
-                        "Gemini returned no text content: "
-                        f"{data}"
+                        "Gemini returned no text content. "
+                        f"finishReason={finish_reason} "
+                        f"response={data}"
                     ),
                     "gemini",
                 )
@@ -794,7 +865,15 @@ class GeminiProvider(AIProvider):
                     "gemini",
                 )
 
-            parts = candidates[0]["content"]["parts"]
+            content = candidates[0].get(
+                "content",
+                {},
+            )
+
+            parts = content.get(
+                "parts",
+                [],
+            )
 
             if not isinstance(
                 parts,
@@ -831,19 +910,30 @@ class GeminiProvider(AIProvider):
     def _extract_function_calls(
         parts: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Extract functionCall objects."""
+        """Extract Gemini functionCall objects."""
 
-        return [
-            part["functionCall"]
-            for part in parts
-            if (
-                isinstance(part, dict)
-                and isinstance(
-                    part.get("functionCall"),
-                    dict,
-                )
+        calls: list[dict[str, Any]] = []
+
+        for part in parts:
+            if not isinstance(
+                part,
+                dict,
+            ):
+                continue
+
+            function_call = part.get(
+                "functionCall"
             )
-        ]
+
+            if isinstance(
+                function_call,
+                dict,
+            ):
+                calls.append(
+                    function_call
+                )
+
+        return calls
 
     # =========================================================================
     # TEXT GENERATION
@@ -858,11 +948,6 @@ class GeminiProvider(AIProvider):
     ) -> str:
         """Generate normal customer-facing text."""
 
-        # Gemini 3.x ignores the old temperature concept and uses thinking
-        # level instead.
-        #
-        # We intentionally use LOW here because PersonaAI is a real-time
-        # customer conversation system.
         body: dict[str, Any] = {
             "contents": [
                 {
@@ -873,7 +958,15 @@ class GeminiProvider(AIProvider):
                         }
                     ],
                 }
-            ]
+            ],
+            "generationConfig": (
+                self._build_generation_config(
+                    model=self.model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    thinking_level=DEFAULT_THINKING_LEVEL,
+                )
+            ),
         }
 
         if system_instruction:
@@ -882,23 +975,8 @@ class GeminiProvider(AIProvider):
                     {
                         "text": system_instruction,
                     }
-                ]
+                ],
             }
-
-        # The body must be generated separately for each model because
-        # primary/fallback models may have different generation semantics.
-        #
-        # `_generate_content_with_fallback()` receives the same body, so use
-        # a configuration that is valid for Gemini 3.x, which is the current
-        # PersonaAI production configuration.
-        body["generationConfig"] = (
-            self._build_generation_config(
-                model=self.model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                thinking_level="low",
-            )
-        )
 
         data = await self._generate_content_with_fallback(
             body
@@ -1089,9 +1167,7 @@ class GeminiProvider(AIProvider):
         """Summarize text."""
 
         constraint = (
-            (
-                f" in no more than {max_words} words"
-            )
+            f" in no more than {max_words} words"
             if max_words
             else " concisely"
         )
@@ -1147,16 +1223,17 @@ class GeminiProvider(AIProvider):
         )
 
         cleaned = (
-            raw
-            .strip()
+            raw.strip()
             .strip('"')
             .strip("'")
         )
 
+        # Exact case-insensitive match first.
         for label in labels:
             if cleaned.lower() == label.lower():
                 return label
 
+        # Then allow a response containing the label.
         for label in labels:
             if label.lower() in cleaned.lower():
                 return label
@@ -1233,7 +1310,7 @@ class GeminiProvider(AIProvider):
                 self._build_generation_config(
                     model=self.model,
                     temperature=0.2,
-                    thinking_level="low",
+                    thinking_level=DEFAULT_THINKING_LEVEL,
                 )
             ),
         }
@@ -1305,7 +1382,7 @@ class GeminiProvider(AIProvider):
                 self._build_generation_config(
                     model=self.model,
                     temperature=0.0,
-                    thinking_level="low",
+                    thinking_level=DEFAULT_THINKING_LEVEL,
                 )
             ),
         }
@@ -1331,7 +1408,26 @@ class GeminiProvider(AIProvider):
         temperature: float = 0.7,
         max_tool_iterations: int = 5,
     ) -> str:
-        """Generate a response using Gemini function calling."""
+        """Generate a response using Gemini function calling.
+
+        Important Gemini function-calling behavior:
+
+        1. Preserve the COMPLETE model response parts.
+           This protects Gemini 3 thought signatures.
+
+        2. Execute each function call locally.
+
+        3. Return the tool result using functionResponse.
+
+        4. Do NOT put `call_id` inside functionResponse.
+           The current Gemini REST schema rejects it there and returns:
+
+               Unknown name "call_id" at
+               'contents[...].parts[0].function_response'
+
+        5. The model's original functionCall part is preserved in the
+           preceding `role=model` content.
+        """
 
         if not tools:
             return await self.generate(
@@ -1349,6 +1445,10 @@ class GeminiProvider(AIProvider):
                 self.name,
             )
 
+        # ---------------------------------------------------------------------
+        # Conversation sent to Gemini.
+        # ---------------------------------------------------------------------
+
         contents: list[dict[str, Any]] = [
             {
                 "role": "user",
@@ -1360,6 +1460,10 @@ class GeminiProvider(AIProvider):
             }
         ]
 
+        # ---------------------------------------------------------------------
+        # Tool definitions.
+        # ---------------------------------------------------------------------
+
         function_declarations = [
             {
                 "name": tool.name,
@@ -1369,21 +1473,31 @@ class GeminiProvider(AIProvider):
             for tool in tools
         ]
 
+        # ---------------------------------------------------------------------
+        # System instruction.
+        # ---------------------------------------------------------------------
+
         base_system_prompt = (
             system_instruction or ""
-        )
+        ).strip()
 
         tool_guidance = (
-            "\n\n"
             "After using tools and receiving their results, "
             "produce a natural final answer for the user. "
             "Do not expose internal tool execution details."
         )
 
-        system_text = (
-            base_system_prompt
-            + tool_guidance
-        )
+        if base_system_prompt:
+            system_text = (
+                f"{base_system_prompt}\n\n"
+                f"{tool_guidance}"
+            )
+        else:
+            system_text = tool_guidance
+
+        # =====================================================================
+        # TOOL LOOP
+        # =====================================================================
 
         for iteration in range(
             1,
@@ -1399,15 +1513,13 @@ class GeminiProvider(AIProvider):
                 self._build_generation_config(
                     model=self.model,
                     temperature=temperature,
-                    thinking_level="low",
+                    thinking_level=DEFAULT_THINKING_LEVEL,
                 )
             )
 
             body: dict[str, Any] = {
                 "contents": contents,
-                "generationConfig": (
-                    generation_config
-                ),
+                "generationConfig": generation_config,
                 "tools": [
                     {
                         "functionDeclarations": (
@@ -1430,10 +1542,18 @@ class GeminiProvider(AIProvider):
                 )
             )
 
-            parts = (
-                self._extract_candidate_parts(
-                    data
-                )
+            # -----------------------------------------------------------------
+            # Preserve every part Gemini returned.
+            #
+            # Do NOT rebuild this from only functionCall objects.
+            #
+            # Gemini 3 models can attach thought signatures and other metadata
+            # to response parts. Preserving the complete parts array keeps the
+            # next turn valid.
+            # -----------------------------------------------------------------
+
+            parts = self._extract_candidate_parts(
+                data
             )
 
             function_calls = (
@@ -1442,15 +1562,21 @@ class GeminiProvider(AIProvider):
                 )
             )
 
-            # ---------------------------------------------------------------
-            # FINAL RESPONSE
-            # ---------------------------------------------------------------
+            # =================================================================
+            # NO TOOL CALL -> FINAL TEXT
+            # =================================================================
 
             if not function_calls:
                 text = "".join(
                     part.get("text", "")
                     for part in parts
-                    if isinstance(part, dict)
+                    if (
+                        isinstance(part, dict)
+                        and isinstance(
+                            part.get("text"),
+                            str,
+                        )
+                    )
                 ).strip()
 
                 if text:
@@ -1473,15 +1599,9 @@ class GeminiProvider(AIProvider):
                     self.name,
                 )
 
-            # ---------------------------------------------------------------
-            # IMPORTANT:
-            #
-            # Preserve the ENTIRE model parts array.
-            #
-            # Gemini 3 models can return thought signatures associated with
-            # tool calls. Removing or reconstructing these parts incorrectly
-            # can break subsequent turns.
-            # ---------------------------------------------------------------
+            # =================================================================
+            # PRESERVE MODEL RESPONSE
+            # =================================================================
 
             contents.append(
                 {
@@ -1489,6 +1609,10 @@ class GeminiProvider(AIProvider):
                     "parts": parts,
                 }
             )
+
+            # =================================================================
+            # EXECUTE TOOLS
+            # =================================================================
 
             function_response_parts: list[
                 dict[str, Any]
@@ -1499,17 +1623,33 @@ class GeminiProvider(AIProvider):
                     "name"
                 )
 
-                tool_args = (
-                    function_call.get("args")
-                    or {}
-                )
+                tool_args = function_call.get(
+                    "args"
+                ) or {}
 
-                # Gemini generateContent function calling
-                # may provide a call ID. Preserve it.
+                # Gemini may provide an identifier for the call.
+                #
+                # We only use it for logging.
+                #
+                # IMPORTANT:
+                # Do NOT send this value inside functionResponse.
                 tool_call_id = (
                     function_call.get("id")
                     or function_call.get("call_id")
                 )
+
+                logger.info(
+                    (
+                        "Executing Gemini tool=%s "
+                        "id=%s"
+                    ),
+                    tool_name or "<missing>",
+                    tool_call_id or "<none>",
+                )
+
+                # -------------------------------------------------------------
+                # Missing tool name
+                # -------------------------------------------------------------
 
                 if not tool_name:
                     result: Any = {
@@ -1522,21 +1662,41 @@ class GeminiProvider(AIProvider):
                     logger.warning(
                         (
                             "Gemini returned function "
-                            "call without name: %s"
+                            "call without a name: %s"
                         ),
                         function_call,
                     )
 
-                else:
-                    logger.info(
+                # -------------------------------------------------------------
+                # Validate tool arguments
+                # -------------------------------------------------------------
+
+                elif not isinstance(
+                    tool_args,
+                    dict,
+                ):
+                    result = {
+                        "error": (
+                            "Gemini returned invalid tool "
+                            "arguments. Expected an object."
+                        ),
+                        "received": tool_args,
+                    }
+
+                    logger.warning(
                         (
-                            "Executing Gemini tool=%s "
-                            "id=%s"
+                            "Invalid arguments for Gemini "
+                            "tool=%s: %r"
                         ),
                         tool_name,
-                        tool_call_id,
+                        tool_args,
                     )
 
+                # -------------------------------------------------------------
+                # Execute tool
+                # -------------------------------------------------------------
+
+                else:
                     try:
                         result = await tool_executor(
                             tool_name,
@@ -1549,27 +1709,48 @@ class GeminiProvider(AIProvider):
                             tool_name,
                         )
 
+                        # Never allow one tool exception to crash the entire
+                        # Gemini conversation. Return the error to Gemini so
+                        # it can decide how to continue.
                         result = {
                             "error": str(exc),
                         }
 
-                function_response: dict[
-                    str,
-                    Any,
-                ] = {
+                # -------------------------------------------------------------
+                # Gemini functionResponse
+                #
+                # IMPORTANT FIX:
+                #
+                # There is intentionally NO `call_id` here.
+                #
+                # The previous implementation generated:
+                #
+                #     "functionResponse": {
+                #         "name": "...",
+                #         "call_id": "...",
+                #         "response": {...}
+                #     }
+                #
+                # Gemini rejected that with HTTP 400:
+                #
+                # Unknown name "call_id" at
+                # contents[2].parts[0].function_response
+                #
+                # The correct payload for the REST schema being used here is:
+                #
+                #     "functionResponse": {
+                #         "name": "...",
+                #         "response": {...}
+                #     }
+                # -------------------------------------------------------------
+
+                function_response = {
                     "name": (
                         tool_name
                         or "unknown"
                     ),
                     "response": result,
                 }
-
-                # Gemini's current function-calling format expects the call
-                # identifier to be preserved when one is returned.
-                if tool_call_id:
-                    function_response["call_id"] = (
-                        tool_call_id
-                    )
 
                 function_response_parts.append(
                     {
@@ -1578,6 +1759,10 @@ class GeminiProvider(AIProvider):
                         ),
                     }
                 )
+
+            # =================================================================
+            # SEND TOOL RESULTS BACK TO GEMINI
+            # =================================================================
 
             contents.append(
                 {
@@ -1620,10 +1805,19 @@ class GeminiProvider(AIProvider):
                 self._build_generation_config(
                     model=self.model,
                     temperature=temperature,
-                    thinking_level="low",
+                    thinking_level=DEFAULT_THINKING_LEVEL,
                 )
             ),
         }
+
+        if system_text:
+            forced_body["systemInstruction"] = {
+                "parts": [
+                    {
+                        "text": system_text,
+                    }
+                ],
+            }
 
         data = (
             await self._generate_content_with_fallback(
