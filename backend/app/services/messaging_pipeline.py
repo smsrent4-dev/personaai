@@ -26,6 +26,8 @@ Important production behavior:
 - If AI routing fails, the pipeline falls back to an already-known/default
   agent where possible instead of unnecessarily abandoning the conversation.
 - Payment receipt images are never treated as automatic payment confirmation.
+- Platform media downloads are normalized before being passed to the AI
+  provider because adapters may return `(bytes, mime_type)` tuples.
 """
 
 import logging
@@ -248,6 +250,142 @@ def _after_hours_reply(settings: dict) -> str | None:
             "hours and will reply as soon as we're back."
         ),
     )
+
+
+# ===========================================================================
+# Media normalization
+# ===========================================================================
+
+
+def _normalize_downloaded_media(
+    media_result: Any,
+    default_mime_type: str,
+) -> tuple[bytes, str]:
+    """Normalize platform media into `(bytes, mime_type)`.
+
+    Different platform adapters may return media in different shapes.
+
+    Supported forms:
+
+        bytes
+        bytearray
+        memoryview
+        (bytes, mime_type)
+        [bytes, mime_type]
+        objects with `.content` / `.mime_type`
+
+    This is important because Telegram media adapters may return:
+
+        (media_bytes, "audio/ogg")
+
+    or:
+
+        (media_bytes, "image/jpeg")
+
+    Passing that tuple directly into `base64.b64encode()` causes:
+
+        TypeError: a bytes-like object is required, not 'tuple'
+    """
+
+    if media_result is None:
+        raise ValueError(
+            "Platform returned no media data"
+        )
+
+    media_bytes: bytes | None = None
+    mime_type: str | None = None
+
+    # -----------------------------------------------------------------------
+    # Raw bytes
+    # -----------------------------------------------------------------------
+
+    if isinstance(media_result, bytes):
+        media_bytes = media_result
+
+    # -----------------------------------------------------------------------
+    # Bytearray
+    # -----------------------------------------------------------------------
+
+    elif isinstance(media_result, bytearray):
+        media_bytes = bytes(media_result)
+
+    # -----------------------------------------------------------------------
+    # Memoryview
+    # -----------------------------------------------------------------------
+
+    elif isinstance(media_result, memoryview):
+        media_bytes = media_result.tobytes()
+
+    # -----------------------------------------------------------------------
+    # Tuple/list.
+    #
+    # Common adapter result:
+    #
+    #     (bytes, "audio/ogg")
+    #
+    # -----------------------------------------------------------------------
+
+    elif isinstance(media_result, (tuple, list)):
+        for item in media_result:
+            if isinstance(item, bytes):
+                media_bytes = item
+
+            elif isinstance(item, bytearray):
+                media_bytes = bytes(item)
+
+            elif isinstance(item, memoryview):
+                media_bytes = item.tobytes()
+
+            elif isinstance(item, str):
+                possible_mime = item.strip()
+
+                if "/" in possible_mime:
+                    mime_type = possible_mime
+
+    # -----------------------------------------------------------------------
+    # Response-like/object result.
+    # -----------------------------------------------------------------------
+
+    else:
+        possible_bytes = getattr(
+            media_result,
+            "content",
+            None,
+        )
+
+        if isinstance(possible_bytes, bytes):
+            media_bytes = possible_bytes
+
+        elif isinstance(possible_bytes, bytearray):
+            media_bytes = bytes(possible_bytes)
+
+        elif isinstance(possible_bytes, memoryview):
+            media_bytes = possible_bytes.tobytes()
+
+        possible_mime = getattr(
+            media_result,
+            "mime_type",
+            None,
+        )
+
+        if isinstance(possible_mime, str):
+            possible_mime = possible_mime.strip()
+
+            if possible_mime:
+                mime_type = possible_mime
+
+    if not media_bytes:
+        raise ValueError(
+            "Platform returned media, but no bytes could be extracted "
+            f"from type {type(media_result).__name__}"
+        )
+
+    final_mime_type = (
+        mime_type
+        or default_mime_type
+    )
+
+    return media_bytes, final_mime_type
 
 
 # ===========================================================================
@@ -514,13 +652,6 @@ class MessagingPipeline:
                     inbound_message=inbound_message,
                 )
 
-                # ------------------------------------------------------------
-                # Important:
-                #
-                # If transcription failed, do NOT send an empty message
-                # into the router/LLM. Send a useful fallback and stop.
-                # ------------------------------------------------------------
-
                 if not effective_text:
                     fallback_message = (
                         "I received your voice message, but I couldn't "
@@ -658,9 +789,9 @@ class MessagingPipeline:
                         effective_text=effective_text,
                     )
 
-                    reply_text = (
-                        str(reply_text or "").strip()
-                    )
+                    reply_text = str(
+                        reply_text or ""
+                    ).strip()
 
                     if not reply_text:
                         raise ValueError(
@@ -729,8 +860,7 @@ class MessagingPipeline:
                     exc_info=True,
                 )
 
-                # The outgoing message is already persisted, so we do not
-                # regenerate it or retry the entire pipeline here.
+                # Do not regenerate or retry the entire pipeline.
                 return
 
             # ----------------------------------------------------------------
@@ -768,13 +898,6 @@ class MessagingPipeline:
             )
 
         except Exception:
-            # ----------------------------------------------------------------
-            # Final safety net.
-            #
-            # IMPORTANT:
-            # We deliberately do NOT retry the complete pipeline here.
-            # ----------------------------------------------------------------
-
             logger.error(
                 (
                     "Unhandled messaging pipeline error "
@@ -845,10 +968,6 @@ class MessagingPipeline:
                 conversation.id,
                 exc_info=True,
             )
-
-        # -------------------------------------------------------------------
-        # Notify owner only once per 24 hours.
-        # -------------------------------------------------------------------
 
         try:
             since = (
@@ -975,16 +1094,7 @@ class MessagingPipeline:
         adapter,
         inbound_message: Message,
     ) -> tuple[bool, str | None]:
-        """Download and understand an incoming image.
-
-        Payment screenshots/receipts receive special handling:
-
-        1. Vision describes the image.
-        2. The image may be classified as a payment receipt.
-        3. If appropriate, the customer's newest unpaid order is located.
-        4. The receipt is attached where supported.
-        5. Payment is NOT automatically confirmed.
-        """
+        """Download and understand an incoming image."""
 
         if not incoming.media_file_id:
             return False, incoming.text
@@ -995,23 +1105,13 @@ class MessagingPipeline:
                 conversation.id,
             )
 
-            image_data = await adapter.download_media(
+            media_result = await adapter.download_media(
                 incoming.media_file_id
             )
 
-            if not image_data:
-                raise ValueError(
-                    "Platform returned empty image data"
-                )
-
-            # ----------------------------------------------------------------
-            # Telegram photos commonly arrive without MIME metadata.
-            # Gemini still needs the MIME type.
-            # ----------------------------------------------------------------
-
-            mime_type = self._get_media_mime_type(
-                incoming,
-                default="image/jpeg",
+            image_data, mime_type = _normalize_downloaded_media(
+                media_result,
+                default_mime_type="image/jpeg",
             )
 
             logger.info(
@@ -1030,9 +1130,9 @@ class MessagingPipeline:
                 )
             )
 
-            description = (
-                str(description or "").strip()
-            )
+            description = str(
+                description or ""
+            ).strip()
 
             if not description:
                 raise ValueError(
@@ -1040,7 +1140,7 @@ class MessagingPipeline:
                 )
 
             # ----------------------------------------------------------------
-            # Save useful image understanding onto original message.
+            # Save image understanding on the original inbound message.
             # ----------------------------------------------------------------
 
             effective_text = "[Customer sent a photo.]"
@@ -1232,23 +1332,13 @@ class MessagingPipeline:
                 incoming.media_file_id,
             )
 
-            audio_data = await adapter.download_media(
+            media_result = await adapter.download_media(
                 incoming.media_file_id
             )
 
-            if not audio_data:
-                raise ValueError(
-                    "Platform returned empty audio data"
-                )
-
-            # ----------------------------------------------------------------
-            # Telegram voice notes normally arrive as .oga / OGG Opus.
-            # Gemini needs the MIME type explicitly.
-            # ----------------------------------------------------------------
-
-            mime_type = self._get_media_mime_type(
-                incoming,
-                default="audio/ogg",
+            audio_data, mime_type = _normalize_downloaded_media(
+                media_result,
+                default_mime_type="audio/ogg",
             )
 
             logger.info(
@@ -1263,9 +1353,9 @@ class MessagingPipeline:
                 )
             )
 
-            transcript = (
-                str(transcript or "").strip()
-            )
+            transcript = str(
+                transcript or ""
+            ).strip()
 
             if not transcript:
                 raise ValueError(
@@ -1288,10 +1378,10 @@ class MessagingPipeline:
                 exc_info=True,
             )
 
-            # Do not return a fabricated transcript.
+            # Never fabricate a transcript.
             #
-            # Returning incoming.text is okay only if the platform supplied
-            # actual text/caption alongside the voice message.
+            # If Telegram/platform supplied a caption/text alongside the
+            # voice message, it is safe to continue with that actual text.
             fallback_text = (
                 str(incoming.text).strip()
                 if incoming.text
@@ -1395,10 +1485,6 @@ class MessagingPipeline:
     ) -> tuple[str, Product | None]:
         """Build context and generate the AI reply."""
 
-        # -------------------------------------------------------------------
-        # No usable text.
-        # -------------------------------------------------------------------
-
         if not effective_text:
             return (
                 _NON_TEXT_ACKNOWLEDGEMENTS.get(
@@ -1447,11 +1533,10 @@ class MessagingPipeline:
         )
 
         # -------------------------------------------------------------------
-        # Conversation history
+        # Conversation history.
         #
-        # Current inbound message is already stored.
-        # Retrieve one extra message so that after removing the current
-        # message we still have the requested context depth.
+        # Current inbound message is already stored. Fetch one extra message
+        # so removing the current message still gives useful context.
         # -------------------------------------------------------------------
 
         history = (
@@ -1485,7 +1570,7 @@ class MessagingPipeline:
         )
 
         # -------------------------------------------------------------------
-        # Customer-aware tool calling
+        # Customer-aware tool calling.
         # -------------------------------------------------------------------
 
         if customer is not None:
@@ -1525,9 +1610,9 @@ class MessagingPipeline:
                 )
             )
 
-        reply_text = (
-            str(reply_text or "").strip()
-        )
+        reply_text = str(
+            reply_text or ""
+        ).strip()
 
         if not reply_text:
             raise ValueError(
@@ -1535,7 +1620,7 @@ class MessagingPipeline:
             )
 
         # -------------------------------------------------------------------
-        # Product image decision
+        # Product image decision.
         # -------------------------------------------------------------------
 
         top_product = None
@@ -1656,7 +1741,7 @@ class MessagingPipeline:
         runs. Therefore, it is excluded from history by database ID and then
         appended exactly once as the latest user turn.
 
-        We compare IDs instead of message text because a customer can
+        IDs are compared rather than message text because a customer can
         legitimately send the exact same text multiple times.
         """
 
@@ -1664,7 +1749,7 @@ class MessagingPipeline:
 
         for message in history:
             # ----------------------------------------------------------------
-            # Skip the current inbound message.
+            # Skip current inbound message.
             # ----------------------------------------------------------------
 
             if (
@@ -1674,7 +1759,7 @@ class MessagingPipeline:
                 continue
 
             # ----------------------------------------------------------------
-            # Customer messages
+            # Customer messages.
             # ----------------------------------------------------------------
 
             if message.role == MessageRole.USER:
@@ -1684,7 +1769,7 @@ class MessagingPipeline:
                     )
 
             # ----------------------------------------------------------------
-            # Agent messages
+            # Agent messages.
             # ----------------------------------------------------------------
 
             elif message.role == MessageRole.AGENT:
@@ -1703,7 +1788,7 @@ class MessagingPipeline:
             )
 
         # --------------------------------------------------------------------
-        # Ask model to produce the next assistant response.
+        # Ask model to produce next assistant response.
         # --------------------------------------------------------------------
 
         lines.append("You:")
