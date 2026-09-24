@@ -25,13 +25,14 @@ Important production behavior:
 - Routing failure and response-generation failure are logged separately.
 - If AI routing fails, the pipeline falls back to an already-known/default
   agent where possible instead of unnecessarily abandoning the conversation.
+- Payment receipt images are never treated as automatic payment confirmation.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
-from fastapi import HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.plan_limits import check_message_limit
@@ -52,14 +53,18 @@ from app.services.order_service import OrderService
 from app.services.platforms.registry import build_adapter
 from app.services.product_service import ProductService
 from app.services.router_service import RouterService
-from app.services.tools import ToolContext, default_tool_definitions, execute_tool
+from app.services.tools import (
+    ToolContext,
+    default_tool_definitions,
+    execute_tool,
+)
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Order/payment constants
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Order / payment constants
+# ===========================================================================
 
 _AWAITING_PAYMENT_STATUSES = {
     PaymentStatus.UNPAID,
@@ -73,23 +78,15 @@ _CLOSED_ORDER_STATUSES = {
 }
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Product matching
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 PRODUCT_PHOTO_MIN_SCORE = 0.5
 
 
 def _build_product_photo_caption(product: Product) -> str:
-    """Build a useful caption for a product image.
-
-    The caption contains:
-      - product name
-      - price/currency
-      - available variants
-      - inventory state
-      - short description
-    """
+    """Build a useful caption for a product image."""
 
     lines = [
         f"{product.name} — {product.price} {product.currency}"
@@ -104,7 +101,9 @@ def _build_product_photo_caption(product: Product) -> str:
     ]
 
     if variant_names:
-        lines.append(f"Available: {', '.join(variant_names)}")
+        lines.append(
+            f"Available: {', '.join(variant_names)}"
+        )
 
     if product.inventory is not None:
         if product.inventory > 0:
@@ -118,32 +117,38 @@ def _build_product_photo_caption(product: Product) -> str:
     return "\n".join(lines)[:1024]
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Non-text fallbacks
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 _NON_TEXT_ACKNOWLEDGEMENTS = {
     MessageType.IMAGE: (
-        "Thanks for the image - I've received it and will follow up shortly."
+        "Thanks for the image — I've received it and will follow up shortly."
     ),
     MessageType.DOCUMENT: (
-        "Thanks for the document - I've received it and will follow up shortly."
+        "Thanks for the document — I've received it and will follow up "
+        "shortly."
     ),
     MessageType.VOICE: (
-        "Thanks for the voice message - I've received it and will follow up shortly."
+        "Thanks for the voice message — I've received it and will follow "
+        "up shortly."
     ),
     MessageType.LOCATION: (
-        "Thanks for sharing your location - noted."
+        "Thanks for sharing your location — noted."
     ),
     MessageType.VIDEO: (
-        "Thanks for the video - I've received it and will follow up shortly."
+        "Thanks for the video — I've received it and will follow up shortly."
     ),
     MessageType.CONTACT: (
-        "Thanks for sharing that contact - noted."
+        "Thanks for sharing that contact — noted."
     ),
     MessageType.OTHER: "Got it, thanks!",
 }
 
+
+# ===========================================================================
+# Business hours
+# ===========================================================================
 
 _WEEKDAY_KEYS = [
     "mon",
@@ -157,32 +162,48 @@ _WEEKDAY_KEYS = [
 
 
 def _after_hours_reply(settings: dict) -> str | None:
-    """Return an after-hours message when business hours are configured."""
+    """Return an after-hours message when business hours are configured.
+
+    Supports both normal windows:
+
+        09:00 -> 17:00
+
+    and overnight windows:
+
+        22:00 -> 06:00
+    """
 
     business_hours = settings.get("business_hours")
 
-    if not business_hours or not business_hours.get("enabled"):
+    if not isinstance(business_hours, dict):
+        return None
+
+    if not business_hours.get("enabled"):
         return None
 
     try:
         import zoneinfo
 
-        timezone_name = business_hours.get("timezone", "UTC")
+        timezone_name = business_hours.get(
+            "timezone",
+            "UTC",
+        )
+
         timezone = zoneinfo.ZoneInfo(timezone_name)
 
         now = datetime.now(timezone)
+
         today_key = _WEEKDAY_KEYS[now.weekday()]
 
-        window = (
-            business_hours
-            .get("hours", {})
-            .get(today_key)
-        )
+        hours = business_hours.get("hours", {})
 
-        if not window:
+        window = hours.get(today_key)
+
+        if not window or len(window) < 2:
             is_open = False
         else:
-            open_str, close_str = window[0], window[1]
+            open_str = str(window[0])
+            close_str = str(window[1])
 
             open_time = datetime.strptime(
                 open_str,
@@ -194,11 +215,25 @@ def _after_hours_reply(settings: dict) -> str | None:
                 "%H:%M",
             ).time()
 
-            is_open = open_time <= now.time() <= close_time
+            current_time = now.time()
+
+            # Normal same-day window.
+            if open_time <= close_time:
+                is_open = (
+                    open_time <= current_time <= close_time
+                )
+
+            # Overnight window such as 22:00 -> 06:00.
+            else:
+                is_open = (
+                    current_time >= open_time
+                    or current_time <= close_time
+                )
 
     except Exception:
         logger.warning(
-            "Malformed business_hours settings; ignoring business-hours rule",
+            "Malformed business_hours settings; "
+            "ignoring business-hours rule",
             exc_info=True,
         )
         return None
@@ -234,9 +269,9 @@ class MessagingPipeline:
         self.customer_service = CustomerService(db)
         self.order_service = OrderService(db)
 
-    # -----------------------------------------------------------------------
+    # =======================================================================
     # Main entry point
-    # -----------------------------------------------------------------------
+    # =======================================================================
 
     async def handle_incoming(
         self,
@@ -249,15 +284,16 @@ class MessagingPipeline:
         adapter = build_adapter(integration)
 
         try:
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
             # 1. Parse incoming platform payload
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
 
             incoming = adapter.parse_incoming(raw_payload)
 
             if incoming is None:
                 logger.debug(
-                    "Platform adapter ignored incoming payload for integration %s",
+                    "Platform adapter ignored incoming payload "
+                    "for integration %s",
                     integration.id,
                 )
                 return
@@ -265,7 +301,8 @@ class MessagingPipeline:
             logger.info(
                 (
                     "Processing incoming message: platform=%s "
-                    "conversation=%s message_type=%s external_message_id=%s"
+                    "conversation=%s message_type=%s "
+                    "external_message_id=%s"
                 ),
                 integration.platform,
                 incoming.external_conversation_id,
@@ -273,9 +310,9 @@ class MessagingPipeline:
                 incoming.external_message_id,
             )
 
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
             # 2. Get/create conversation
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
 
             conversation = (
                 await self.conversation_service.get_or_create_conversation(
@@ -289,31 +326,38 @@ class MessagingPipeline:
                 )
             )
 
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
             # 3. Store inbound message
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
 
-            inbound_message = await self.conversation_service.add_message(
-                conversation,
-                role=MessageRole.USER,
-                content=incoming.text,
-                message_type=incoming.message_type,
-                external_message_id=incoming.external_message_id,
-                media_file_id=incoming.media_file_id,
-                latitude=incoming.latitude,
-                longitude=incoming.longitude,
-                platform_metadata=incoming.platform_metadata,
+            inbound_message = (
+                await self.conversation_service.add_message(
+                    conversation,
+                    role=MessageRole.USER,
+                    content=incoming.text,
+                    message_type=incoming.message_type,
+                    external_message_id=(
+                        incoming.external_message_id
+                    ),
+                    media_file_id=incoming.media_file_id,
+                    latitude=incoming.latitude,
+                    longitude=incoming.longitude,
+                    platform_metadata=incoming.platform_metadata,
+                )
             )
 
             await self.db.commit()
 
-            # ---------------------------------------------------------------
-            # 4. Mark platform message as read / typing
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
+            # 4. Mark message as read / typing
+            # ----------------------------------------------------------------
 
             if (
                 incoming.external_message_id
-                and integration.settings.get("read_receipts", True)
+                and integration.settings.get(
+                    "read_receipts",
+                    True,
+                )
             ):
                 try:
                     await adapter.mark_read(
@@ -330,9 +374,9 @@ class MessagingPipeline:
                         exc_info=True,
                     )
 
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
             # 5. Get/create customer
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
 
             customer = None
 
@@ -348,29 +392,36 @@ class MessagingPipeline:
 
                 await self.db.commit()
 
-            # ---------------------------------------------------------------
-            # 6. Human takeover / auto-reply disabled
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
+            # 6. Human takeover / auto-reply
+            # ----------------------------------------------------------------
 
             if conversation.assigned_to_human:
                 logger.info(
-                    "Skipping AI reply because conversation %s is assigned "
-                    "to a human",
+                    (
+                        "Skipping AI reply because conversation %s "
+                        "is assigned to a human"
+                    ),
                     conversation.id,
                 )
                 return
 
-            if not integration.settings.get("auto_reply", True):
+            if not integration.settings.get(
+                "auto_reply",
+                True,
+            ):
                 logger.info(
-                    "Skipping AI reply because auto_reply is disabled "
-                    "for integration %s",
+                    (
+                        "Skipping AI reply because auto_reply is disabled "
+                        "for integration %s"
+                    ),
                     integration.id,
                 )
                 return
 
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
             # 7. Business-hours rule
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
 
             after_hours_reply = _after_hours_reply(
                 integration.settings
@@ -385,16 +436,26 @@ class MessagingPipeline:
 
                 await self.db.commit()
 
-                await adapter.send_text(
-                    incoming.external_conversation_id,
-                    after_hours_reply,
-                )
+                try:
+                    await adapter.send_text(
+                        incoming.external_conversation_id,
+                        after_hours_reply,
+                    )
+                except Exception:
+                    logger.warning(
+                        (
+                            "Failed to send after-hours reply "
+                            "for conversation %s"
+                        ),
+                        conversation.id,
+                        exc_info=True,
+                    )
 
                 return
 
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
             # 8. Plan message limit
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
 
             limit_reached, plan = await check_message_limit(
                 self.db,
@@ -411,11 +472,15 @@ class MessagingPipeline:
                 )
                 return
 
-            # ---------------------------------------------------------------
-            # 9. Convert image/voice into useful text
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
+            # 9. Convert image / voice into useful text
+            # ----------------------------------------------------------------
 
             effective_text = incoming.text
+
+            # ----------------------------------------------------------------
+            # IMAGE
+            # ----------------------------------------------------------------
 
             if (
                 incoming.message_type == MessageType.IMAGE
@@ -435,6 +500,10 @@ class MessagingPipeline:
                 if handled:
                     return
 
+            # ----------------------------------------------------------------
+            # VOICE
+            # ----------------------------------------------------------------
+
             elif (
                 incoming.message_type == MessageType.VOICE
                 and incoming.media_file_id
@@ -445,14 +514,48 @@ class MessagingPipeline:
                     inbound_message=inbound_message,
                 )
 
-            # ---------------------------------------------------------------
+                # ------------------------------------------------------------
+                # Important:
+                #
+                # If transcription failed, do NOT send an empty message
+                # into the router/LLM. Send a useful fallback and stop.
+                # ------------------------------------------------------------
+
+                if not effective_text:
+                    fallback_message = (
+                        "I received your voice message, but I couldn't "
+                        "understand the audio right now. Please try sending "
+                        "the voice note again."
+                    )
+
+                    await self.conversation_service.add_message(
+                        conversation,
+                        role=MessageRole.AGENT,
+                        content=fallback_message,
+                    )
+
+                    await self.db.commit()
+
+                    try:
+                        await adapter.send_text(
+                            incoming.external_conversation_id,
+                            fallback_message,
+                        )
+                    except Exception:
+                        logger.warning(
+                            (
+                                "Failed to send voice transcription "
+                                "fallback for conversation %s"
+                            ),
+                            conversation.id,
+                            exc_info=True,
+                        )
+
+                    return
+
+            # ----------------------------------------------------------------
             # 10. Select agent
-            #
-            # IMPORTANT:
-            # Routing failure is handled separately from response failure.
-            # If AI routing is temporarily unavailable, we still try to use
-            # the conversation/default/first active agent.
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
 
             agent = None
 
@@ -469,7 +572,10 @@ class MessagingPipeline:
                     )
 
                     logger.info(
-                        "AI routing selected agent %s for conversation %s",
+                        (
+                            "AI routing selected agent %s "
+                            "for conversation %s"
+                        ),
                         getattr(agent, "id", None),
                         conversation.id,
                     )
@@ -478,7 +584,7 @@ class MessagingPipeline:
                     logger.error(
                         (
                             "AI routing failed for conversation %s; "
-                            "falling back to a deterministic agent"
+                            "falling back to deterministic agent"
                         ),
                         conversation.id,
                         exc_info=True,
@@ -499,6 +605,7 @@ class MessagingPipeline:
                             conversation.id,
                             exc_info=True,
                         )
+
                         agent = None
 
             else:
@@ -514,17 +621,19 @@ class MessagingPipeline:
                         conversation.id,
                         exc_info=True,
                     )
+
                     agent = None
 
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
             # 11. Generate response
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
 
             if agent is None:
                 reply_text = (
                     "Sorry, we're unable to respond right now. "
                     "A team member will follow up shortly."
                 )
+
                 top_product = None
 
             else:
@@ -549,8 +658,20 @@ class MessagingPipeline:
                         effective_text=effective_text,
                     )
 
+                    reply_text = (
+                        str(reply_text or "").strip()
+                    )
+
+                    if not reply_text:
+                        raise ValueError(
+                            "AI provider returned an empty reply"
+                        )
+
                     logger.info(
-                        "AI reply generated successfully for conversation %s",
+                        (
+                            "AI reply generated successfully "
+                            "for conversation %s"
+                        ),
                         conversation.id,
                     )
 
@@ -572,24 +693,54 @@ class MessagingPipeline:
 
                     top_product = None
 
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
             # 12. Store outgoing message
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
 
             await self.conversation_service.add_message(
                 conversation,
                 role=MessageRole.AGENT,
                 content=reply_text,
-                agent_id=agent.id if agent is not None else None,
+                agent_id=(
+                    agent.id
+                    if agent is not None
+                    else None
+                ),
             )
 
             await self.db.commit()
 
-            # ---------------------------------------------------------------
-            # 13. Optional product image
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
+            # 13. Send final text response
+            # ----------------------------------------------------------------
 
-            if top_product is not None and top_product.images:
+            try:
+                await adapter.send_text(
+                    incoming.external_conversation_id,
+                    reply_text,
+                )
+            except Exception:
+                logger.error(
+                    (
+                        "Failed to send AI text response "
+                        "for conversation %s"
+                    ),
+                    conversation.id,
+                    exc_info=True,
+                )
+
+                # The outgoing message is already persisted, so we do not
+                # regenerate it or retry the entire pipeline here.
+                return
+
+            # ----------------------------------------------------------------
+            # 14. Optional product image
+            # ----------------------------------------------------------------
+
+            if (
+                top_product is not None
+                and top_product.images
+            ):
                 try:
                     caption = _build_product_photo_caption(
                         top_product
@@ -608,32 +759,27 @@ class MessagingPipeline:
                         exc_info=True,
                     )
 
-            # ---------------------------------------------------------------
-            # 14. Send final text response
-            # ---------------------------------------------------------------
-
-            await adapter.send_text(
-                incoming.external_conversation_id,
-                reply_text,
-            )
-
             logger.info(
-                "Incoming message processing completed: conversation=%s",
+                (
+                    "Incoming message processing completed: "
+                    "conversation=%s"
+                ),
                 conversation.id,
             )
 
         except Exception:
-            # This is intentionally only the final safety net.
+            # ----------------------------------------------------------------
+            # Final safety net.
             #
-            # We do not retry the whole pipeline here because a retry could
-            # repeat side effects such as:
-            #   - creating orders
-            #   - attaching receipts
-            #   - executing customer tools
-            #   - sending duplicate platform messages
-            #
+            # IMPORTANT:
+            # We deliberately do NOT retry the complete pipeline here.
+            # ----------------------------------------------------------------
+
             logger.error(
-                "Unhandled messaging pipeline error for integration %s",
+                (
+                    "Unhandled messaging pipeline error "
+                    "for integration %s"
+                ),
                 integration.id,
                 exc_info=True,
             )
@@ -641,7 +787,11 @@ class MessagingPipeline:
             raise
 
         finally:
-            aclose = getattr(adapter, "aclose", None)
+            aclose = getattr(
+                adapter,
+                "aclose",
+                None,
+            )
 
             if aclose is not None:
                 try:
@@ -652,9 +802,9 @@ class MessagingPipeline:
                         exc_info=True,
                     )
 
-    # -----------------------------------------------------------------------
+    # =======================================================================
     # Plan limit
-    # -----------------------------------------------------------------------
+    # =======================================================================
 
     async def _handle_message_limit_reached(
         self,
@@ -664,7 +814,7 @@ class MessagingPipeline:
         adapter: Any,
         plan: Any,
     ) -> None:
-        """Send a plan-limit response and notify the owner once per day."""
+        """Send a plan-limit response and notify owner once per 24 hours."""
 
         reply = (
             "Thanks for your message! We've reached our messaging limit "
@@ -685,38 +835,50 @@ class MessagingPipeline:
                 conversation.external_conversation_id,
                 reply,
             )
+
         except Exception:
             logger.warning(
-                "Failed to send plan-limit message for conversation %s",
+                (
+                    "Failed to send plan-limit message "
+                    "for conversation %s"
+                ),
                 conversation.id,
                 exc_info=True,
             )
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         # Notify owner only once per 24 hours.
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         try:
-            since = datetime.now().astimezone() - __import__(
-                "datetime"
-            ).timedelta(hours=24)
+            since = (
+                datetime.now().astimezone()
+                - timedelta(hours=24)
+            )
 
             existing_notification = await self.db.scalar(
                 select(Notification)
                 .where(
                     Notification.owner_id == owner.id,
-                    Notification.type == NotificationType.PLAN_LIMIT_REACHED,
+                    Notification.type
+                    == NotificationType.PLAN_LIMIT_REACHED,
                     Notification.created_at >= since,
                 )
-                .order_by(Notification.created_at.desc())
+                .order_by(
+                    Notification.created_at.desc()
+                )
             )
 
             if existing_notification is None:
-                notification_service = NotificationService(self.db)
+                notification_service = NotificationService(
+                    self.db
+                )
 
                 await notification_service.create_notification(
                     owner_id=owner.id,
-                    notification_type=NotificationType.PLAN_LIMIT_REACHED,
+                    notification_type=(
+                        NotificationType.PLAN_LIMIT_REACHED
+                    ),
                     title="Monthly messaging limit reached",
                     message=(
                         "Your monthly messaging limit has been reached. "
@@ -728,25 +890,27 @@ class MessagingPipeline:
 
         except Exception:
             logger.warning(
-                "Failed to create plan-limit notification for owner %s",
+                (
+                    "Failed to create plan-limit notification "
+                    "for owner %s"
+                ),
                 owner.id,
                 exc_info=True,
             )
 
-    # -----------------------------------------------------------------------
+    # =======================================================================
     # Receipt order lookup
-    # -----------------------------------------------------------------------
+    # =======================================================================
 
     async def _find_receipt_target_order(
         self,
         owner_id,
         customer_id,
     ):
-        """Find the customer's newest order that is awaiting payment.
+        """Find newest customer order awaiting payment.
 
-        We deliberately do not auto-confirm payment. A receipt image can
-        be attached to the relevant order, but final payment confirmation
-        remains a business-side decision.
+        A receipt is attached to the order, but payment is NOT automatically
+        confirmed.
         """
 
         orders = await self.order_service.list_orders(
@@ -763,9 +927,44 @@ class MessagingPipeline:
 
         return None
 
-    # -----------------------------------------------------------------------
+    # =======================================================================
+    # Media MIME helpers
+    # =======================================================================
+
+    @staticmethod
+    def _get_media_mime_type(
+        incoming,
+        default: str,
+    ) -> str:
+        """Get MIME type from platform metadata with a safe fallback."""
+
+        metadata = getattr(
+            incoming,
+            "platform_metadata",
+            None,
+        )
+
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        mime_type = (
+            metadata.get("mime_type")
+            or metadata.get("mimeType")
+            or metadata.get("content_type")
+            or metadata.get("contentType")
+        )
+
+        if isinstance(mime_type, str):
+            mime_type = mime_type.strip().lower()
+
+            if mime_type:
+                return mime_type
+
+        return default
+
+    # =======================================================================
     # Image handling
-    # -----------------------------------------------------------------------
+    # =======================================================================
 
     async def _handle_image_message(
         self,
@@ -781,13 +980,10 @@ class MessagingPipeline:
         Payment screenshots/receipts receive special handling:
 
         1. Vision describes the image.
-        2. If it appears to be a payment confirmation, we locate the
-           customer's newest order awaiting payment.
-        3. The image is attached as a receipt where supported.
-        4. Payment is NOT automatically confirmed.
-
-        This prevents the AI from treating a screenshot as proof that
-        money has actually settled.
+        2. The image may be classified as a payment receipt.
+        3. If appropriate, the customer's newest unpaid order is located.
+        4. The receipt is attached where supported.
+        5. Payment is NOT automatically confirmed.
         """
 
         if not incoming.media_file_id:
@@ -804,33 +1000,50 @@ class MessagingPipeline:
             )
 
             if not image_data:
-                raise ValueError("Platform returned empty image data")
+                raise ValueError(
+                    "Platform returned empty image data"
+                )
+
+            # ----------------------------------------------------------------
+            # Telegram photos commonly arrive without MIME metadata.
+            # Gemini still needs the MIME type.
+            # ----------------------------------------------------------------
+
+            mime_type = self._get_media_mime_type(
+                incoming,
+                default="image/jpeg",
+            )
 
             logger.info(
-                "Analyzing image for conversation %s",
+                (
+                    "Analyzing image for conversation %s "
+                    "with mime_type=%s"
+                ),
                 conversation.id,
+                mime_type,
             )
 
             description = (
                 await self.router_service.ai_provider.describe_image(
-                    image_data
+                    image_data,
+                    mime_type=mime_type,
                 )
             )
 
-            description = (description or "").strip()
+            description = (
+                str(description or "").strip()
+            )
 
             if not description:
                 raise ValueError(
                     "Image analysis returned empty description"
                 )
 
-            # -----------------------------------------------------------
-            # Save useful image understanding onto the original message.
-            # -----------------------------------------------------------
+            # ----------------------------------------------------------------
+            # Save useful image understanding onto original message.
+            # ----------------------------------------------------------------
 
-            effective_text = (
-                "[Customer sent a photo.]"
-            )
+            effective_text = "[Customer sent a photo.]"
 
             if incoming.text:
                 effective_text += (
@@ -845,15 +1058,13 @@ class MessagingPipeline:
 
             await self.db.commit()
 
-            # -----------------------------------------------------------
+            # ----------------------------------------------------------------
             # Payment receipt detection.
-            #
-            # We use a second lightweight AI classification here because
-            # image description alone is not guaranteed to distinguish
-            # a receipt from a normal product/photo image.
-            # -----------------------------------------------------------
+            # ----------------------------------------------------------------
 
             if customer is not None:
+                is_payment_receipt = False
+
                 try:
                     classification = (
                         await self.router_service.ai_provider.classify(
@@ -877,23 +1088,27 @@ class MessagingPipeline:
                     )
 
                     is_payment_receipt = (
-                        "payment_receipt" in normalized_classification
-                        or "bank_transfer" in normalized_classification
+                        "payment_receipt"
+                        in normalized_classification
+                        or "bank_transfer"
+                        in normalized_classification
                         or normalized_classification
-                        == "payment_receipt_or_bank_transfer_confirmation"
+                        == (
+                            "payment_receipt_or_bank_transfer_"
+                            "confirmation"
+                        )
                     )
 
                 except Exception:
                     logger.warning(
                         (
-                            "Image classification failed for conversation "
-                            "%s; treating image as a normal image"
+                            "Image classification failed for "
+                            "conversation %s; treating image as "
+                            "a normal image"
                         ),
                         conversation.id,
                         exc_info=True,
                     )
-
-                    is_payment_receipt = False
 
                 if is_payment_receipt:
                     order = await self._find_receipt_target_order(
@@ -923,15 +1138,25 @@ class MessagingPipeline:
 
                             await self.db.commit()
 
-                            await adapter.send_text(
-                                incoming.external_conversation_id,
-                                confirmation,
-                            )
+                            try:
+                                await adapter.send_text(
+                                    incoming.external_conversation_id,
+                                    confirmation,
+                                )
+                            except Exception:
+                                logger.warning(
+                                    (
+                                        "Failed to send payment receipt "
+                                        "confirmation for conversation %s"
+                                    ),
+                                    conversation.id,
+                                    exc_info=True,
+                                )
 
                             logger.info(
                                 (
-                                    "Payment receipt attached to order %s "
-                                    "for conversation %s"
+                                    "Payment receipt attached to "
+                                    "order %s for conversation %s"
                                 ),
                                 order.id,
                                 conversation.id,
@@ -942,8 +1167,8 @@ class MessagingPipeline:
                         except Exception:
                             logger.error(
                                 (
-                                    "Failed to attach payment receipt for "
-                                    "order %s"
+                                    "Failed to attach payment receipt "
+                                    "for order %s"
                                 ),
                                 order.id,
                                 exc_info=True,
@@ -953,14 +1178,16 @@ class MessagingPipeline:
 
         except Exception:
             logger.error(
-                "Image processing failed for conversation %s",
+                (
+                    "Image processing failed for conversation %s"
+                ),
                 conversation.id,
                 exc_info=True,
             )
 
             fallback = _NON_TEXT_ACKNOWLEDGEMENTS.get(
                 MessageType.IMAGE,
-                "Thanks for the image - I've received it.",
+                "Thanks for the image — I've received it.",
             )
 
             await self.conversation_service.add_message(
@@ -984,9 +1211,9 @@ class MessagingPipeline:
 
             return True, None
 
-    # -----------------------------------------------------------------------
+    # =======================================================================
     # Voice handling
-    # -----------------------------------------------------------------------
+    # =======================================================================
 
     async def _transcribe_voice(
         self,
@@ -1010,15 +1237,35 @@ class MessagingPipeline:
             )
 
             if not audio_data:
-                raise ValueError("Platform returned empty audio data")
+                raise ValueError(
+                    "Platform returned empty audio data"
+                )
+
+            # ----------------------------------------------------------------
+            # Telegram voice notes normally arrive as .oga / OGG Opus.
+            # Gemini needs the MIME type explicitly.
+            # ----------------------------------------------------------------
+
+            mime_type = self._get_media_mime_type(
+                incoming,
+                default="audio/ogg",
+            )
+
+            logger.info(
+                "Transcribing voice message with mime_type=%s",
+                mime_type,
+            )
 
             transcript = (
                 await self.router_service.ai_provider.transcribe_audio(
-                    audio_data
+                    audio_data,
+                    mime_type=mime_type,
                 )
             )
 
-            transcript = (transcript or "").strip()
+            transcript = (
+                str(transcript or "").strip()
+            )
 
             if not transcript:
                 raise ValueError(
@@ -1041,11 +1288,21 @@ class MessagingPipeline:
                 exc_info=True,
             )
 
-            return incoming.text
+            # Do not return a fabricated transcript.
+            #
+            # Returning incoming.text is okay only if the platform supplied
+            # actual text/caption alongside the voice message.
+            fallback_text = (
+                str(incoming.text).strip()
+                if incoming.text
+                else ""
+            )
 
-    # -----------------------------------------------------------------------
+            return fallback_text or None
+
+    # =======================================================================
     # Deterministic agent selection
-    # -----------------------------------------------------------------------
+    # =======================================================================
 
     async def _pick_agent_without_ai(
         self,
@@ -1062,9 +1319,9 @@ class MessagingPipeline:
         3. First active owner agent.
         """
 
-        # ---------------------------------------------------------------
-        # Existing conversation assignment
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
+        # 1. Existing conversation assignment
+        # -------------------------------------------------------------------
 
         if conversation.agent_id:
             result = await self.db.execute(
@@ -1079,9 +1336,9 @@ class MessagingPipeline:
             if agent is not None:
                 return agent
 
-        # ---------------------------------------------------------------
-        # Integration default agent
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
+        # 2. Integration default agent
+        # -------------------------------------------------------------------
 
         default_agent_id = integration.default_agent_id
 
@@ -1098,9 +1355,9 @@ class MessagingPipeline:
             if agent is not None:
                 return agent
 
-        # ---------------------------------------------------------------
-        # First active agent
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
+        # 3. First active owner agent
+        # -------------------------------------------------------------------
 
         result = await self.db.execute(
             select(Agent)
@@ -1108,7 +1365,9 @@ class MessagingPipeline:
                 Agent.owner_id == owner_id,
                 Agent.status == AgentStatus.ACTIVE,
             )
-            .order_by(Agent.created_at.asc())
+            .order_by(
+                Agent.created_at.asc()
+            )
         )
 
         agent = result.scalars().first()
@@ -1116,14 +1375,13 @@ class MessagingPipeline:
         if agent is not None:
             return agent
 
-        raise HTTPException(
-            status_code=404,
-            detail="No active AI agent is available for this account.",
+        raise RuntimeError(
+            "No active AI agent is available for this account."
         )
 
-    # -----------------------------------------------------------------------
+    # =======================================================================
     # Build AI response
-    # -----------------------------------------------------------------------
+    # =======================================================================
 
     async def _build_reply(
         self,
@@ -1137,9 +1395,9 @@ class MessagingPipeline:
     ) -> tuple[str, Product | None]:
         """Build context and generate the AI reply."""
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         # No usable text.
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         if not effective_text:
             return (
@@ -1150,82 +1408,75 @@ class MessagingPipeline:
                 None,
             )
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         # RAG: knowledge
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
-        knowledge_results = await self.knowledge_service.search(
-            owner.id,
-            effective_text,
-            agent_id=agent.id,
-            top_k=3,
+        knowledge_results = (
+            await self.knowledge_service.search(
+                owner.id,
+                effective_text,
+                agent_id=agent.id,
+                top_k=3,
+            )
         )
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         # RAG: memory
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
-        memory_results = await self.memory_service.search(
-            owner.id,
-            effective_text,
-            agent_id=agent.id,
-            top_k=3,
+        memory_results = (
+            await self.memory_service.search(
+                owner.id,
+                effective_text,
+                agent_id=agent.id,
+                top_k=3,
+            )
         )
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         # Product search
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
-        product_results = await self.product_service.search(
-            owner.id,
-            effective_text,
-            top_k=3,
+        product_results = (
+            await self.product_service.search(
+                owner.id,
+                effective_text,
+                top_k=3,
+            )
         )
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         # Conversation history
         #
-        # We intentionally retrieve one extra message because the current
-        # inbound message has already been stored in the database.
-        # _build_prompt() then excludes that exact message by ID.
-        # ---------------------------------------------------------------
+        # Current inbound message is already stored.
+        # Retrieve one extra message so that after removing the current
+        # message we still have the requested context depth.
+        # -------------------------------------------------------------------
 
-        history = await self.conversation_service.get_recent_messages(
-            conversation.id,
-            limit=11,
+        history = (
+            await self.conversation_service.get_recent_messages(
+                conversation.id,
+                limit=11,
+            )
         )
 
-        # ---------------------------------------------------------------
-        # Build system instruction
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
+        # System instruction
+        # -------------------------------------------------------------------
 
-        system_instruction = self._build_system_instruction(
-            agent=agent,
-            knowledge_results=knowledge_results,
-            memory_results=memory_results,
-            product_results=product_results,
+        system_instruction = (
+            self._build_system_instruction(
+                agent=agent,
+                knowledge_results=knowledge_results,
+                memory_results=memory_results,
+                product_results=product_results,
+            )
         )
 
-        # ---------------------------------------------------------------
-        # Build conversation prompt.
-        #
-        # IMPORTANT:
-        # inbound_message.id is passed so the current message is not added
-        # twice:
-        #
-        # history:
-        #   Customer: Hello
-        #   You: Hi
-        #   Customer: What is the price?
-        #
-        # latest_text:
-        #   What is the price?
-        #
-        # Before this fix the prompt could become:
-        #
-        #   Customer: What is the price?
-        #   Customer: What is the price?
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
+        # Conversation prompt
+        # -------------------------------------------------------------------
 
         prompt = self._build_prompt(
             history=history,
@@ -1233,9 +1484,9 @@ class MessagingPipeline:
             current_message_id=inbound_message.id,
         )
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         # Customer-aware tool calling
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         if customer is not None:
             context = ToolContext(
@@ -1266,29 +1517,43 @@ class MessagingPipeline:
             )
 
         else:
-            reply_text = await self.router_service.ai_provider.generate(
-                prompt,
-                system_instruction=system_instruction,
-                temperature=agent.temperature,
+            reply_text = (
+                await self.router_service.ai_provider.generate(
+                    prompt,
+                    system_instruction=system_instruction,
+                    temperature=agent.temperature,
+                )
             )
 
-        # ---------------------------------------------------------------
+        reply_text = (
+            str(reply_text or "").strip()
+        )
+
+        if not reply_text:
+            raise ValueError(
+                "AI provider returned an empty response"
+            )
+
+        # -------------------------------------------------------------------
         # Product image decision
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         top_product = None
 
         if product_results:
             best_product, best_score = product_results[0]
 
-            if best_score >= PRODUCT_PHOTO_MIN_SCORE:
+            if (
+                best_product is not None
+                and best_score >= PRODUCT_PHOTO_MIN_SCORE
+            ):
                 top_product = best_product
 
         return reply_text, top_product
 
-    # -----------------------------------------------------------------------
+    # =======================================================================
     # System prompt
-    # -----------------------------------------------------------------------
+    # =======================================================================
 
     @staticmethod
     def _build_system_instruction(
@@ -1299,43 +1564,50 @@ class MessagingPipeline:
     ) -> str:
         """Build the system instruction supplied to the AI model."""
 
-        parts = [
-            agent.instructions,
-        ]
+        parts: list[str] = []
 
-        # ---------------------------------------------------------------
+        if agent.instructions:
+            parts.append(
+                str(agent.instructions)
+            )
+
+        # -------------------------------------------------------------------
         # Knowledge
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         if knowledge_results:
             knowledge_lines = "\n".join(
                 f"- {chunk.content}"
                 for chunk, _score in knowledge_results
+                if chunk.content
             )
 
-            parts.append(
-                "Relevant knowledge base entries:\n"
-                f"{knowledge_lines}"
-            )
+            if knowledge_lines:
+                parts.append(
+                    "Relevant knowledge base entries:\n"
+                    f"{knowledge_lines}"
+                )
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         # Memory
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         if memory_results:
             memory_lines = "\n".join(
                 f"- {entry.content}"
                 for entry, _score in memory_results
+                if entry.content
             )
 
-            parts.append(
-                "Relevant things you know/remember:\n"
-                f"{memory_lines}"
-            )
+            if memory_lines:
+                parts.append(
+                    "Relevant things you know/remember:\n"
+                    f"{memory_lines}"
+                )
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         # Products
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         if product_results:
             product_lines = "\n".join(
@@ -1356,20 +1628,21 @@ class MessagingPipeline:
                 for product, _score in product_results
             )
 
-            parts.append(
-                "Relevant products/services you can sell:\n"
-                f"{product_lines}"
-            )
+            if product_lines:
+                parts.append(
+                    "Relevant products/services you can sell:\n"
+                    f"{product_lines}"
+                )
 
         return "\n\n".join(
-            part
+            part.strip()
             for part in parts
-            if part
+            if part and str(part).strip()
         )
 
-    # -----------------------------------------------------------------------
+    # =======================================================================
     # Conversation prompt
-    # -----------------------------------------------------------------------
+    # =======================================================================
 
     @staticmethod
     def _build_prompt(
@@ -1377,21 +1650,22 @@ class MessagingPipeline:
         latest_text: str,
         current_message_id=None,
     ) -> str:
-        """Build the conversation prompt without duplicating the latest turn.
+        """Build conversation prompt without duplicating current turn.
 
         The current incoming message is already persisted before this method
-        is called. Therefore, when it exists in `history`, it must be skipped.
+        runs. Therefore, it is excluded from history by database ID and then
+        appended exactly once as the latest user turn.
 
-        We identify it by database ID rather than matching text because a
-        customer can legitimately send the exact same text more than once.
+        We compare IDs instead of message text because a customer can
+        legitimately send the exact same text multiple times.
         """
 
         lines: list[str] = []
 
         for message in history:
-            # -----------------------------------------------------------
-            # Do not include the current inbound message twice.
-            # -----------------------------------------------------------
+            # ----------------------------------------------------------------
+            # Skip the current inbound message.
+            # ----------------------------------------------------------------
 
             if (
                 current_message_id is not None
@@ -1399,11 +1673,19 @@ class MessagingPipeline:
             ):
                 continue
 
+            # ----------------------------------------------------------------
+            # Customer messages
+            # ----------------------------------------------------------------
+
             if message.role == MessageRole.USER:
                 if message.content:
                     lines.append(
                         f"Customer: {message.content}"
                     )
+
+            # ----------------------------------------------------------------
+            # Agent messages
+            # ----------------------------------------------------------------
 
             elif message.role == MessageRole.AGENT:
                 if message.content:
@@ -1411,14 +1693,18 @@ class MessagingPipeline:
                         f"You: {message.content}"
                     )
 
-        # ---------------------------------------------------------------
-        # Always add the current user turn exactly once.
-        # ---------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # Add current user turn exactly once.
+        # --------------------------------------------------------------------
 
         if latest_text:
             lines.append(
                 f"Customer: {latest_text}"
             )
+
+        # --------------------------------------------------------------------
+        # Ask model to produce the next assistant response.
+        # --------------------------------------------------------------------
 
         lines.append("You:")
 
