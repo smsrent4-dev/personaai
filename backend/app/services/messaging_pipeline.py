@@ -15,7 +15,7 @@ Flow for handle_incoming():
  11. Generate the AI response.
  12. Store the outgoing message.
  13. Send the response through the same platform.
- 14. Send a relevant product image when the customer explicitly asks
+ 14. Send a product image ONLY when the customer explicitly asks
      to see/show/send a product image.
 
 Important production behavior:
@@ -31,6 +31,7 @@ Important production behavior:
   provider because adapters may return `(bytes, mime_type)` tuples.
 - Explicit product-image requests are handled by application logic rather
   than asking the LLM to physically send the image.
+- Normal product searches NEVER cause product images to be sent automatically.
 """
 
 from __future__ import annotations
@@ -87,57 +88,119 @@ _CLOSED_ORDER_STATUSES = {
 
 
 # ===========================================================================
-# Product matching
+# Product image intent
 # ===========================================================================
 
-PRODUCT_PHOTO_MIN_SCORE = 0.5
-
-# Explicit image/photo/show requests.
+# IMPORTANT:
 #
-# The purpose of this detector is NOT to replace semantic product search.
-# It simply tells the application:
+# This detector is ONLY for deciding whether the customer explicitly wants
+# a product image.
 #
-#     "The customer wants to see an image."
+# It is NOT used to decide whether a product is relevant to the conversation.
 #
-# ProductService.search() is still responsible for finding the product.
+# Normal product questions such as:
+#
+#   "How much is the hoodie?"
+#   "Do you have the black hoodie?"
+#   "Is the hoodie available?"
+#   "What sizes does the hoodie come in?"
+#   "Show me the price"
+#
+# must NOT cause an image to be sent.
+#
+# Explicit visual requests such as:
+#
+#   "Send me a picture of the hoodie"
+#   "Show me an image of the black hoodie"
+#   "Can I see the hoodie?"
+#   "What does the hoodie look like?"
+#
+# may cause an image to be sent.
 _PRODUCT_IMAGE_INTENT_PATTERNS = (
-    r"\b(send|show|see|view|get|share)\b.{0,40}\b("
-    r"photo|picture|pic|image|images|photos|pictures"
-    r")\b",
-    r"\b("
-    r"photo|picture|pic|image|images|photos|pictures"
-    r")\b.{0,40}\b("
-    r"send|show|see|view|get|share"
-    r")\b",
-    r"\bcan\s+i\s+(see|view)\b",
-    r"\b(let|allow)\s+me\s+(see|view)\b",
-    r"\bwhat\s+(does|do)\b.{0,50}\b("
-    r"look\s+like|looks\s+like"
-    r")\b",
-    r"\bshow\s+me\b",
-    r"\blet\s+me\s+see\b",
-    r"\bi\s+want\s+to\s+see\b",
-    r"\bcan\s+you\s+show\b",
-    r"\bcan\s+you\s+send\b.{0,40}\b("
-    r"photo|picture|pic|image"
-    r")\b",
+    # "send/show/share/get/view + image word"
+    r"\b(?:send|show|see|view|get|share)\b.{0,50}\b"
+    r"(?:photo|picture|pic|image|images|photos|pictures)\b",
+
+    # "image word + send/show/share/get/view"
+    r"\b(?:photo|picture|pic|image|images|photos|pictures)\b"
+    r".{0,50}\b(?:send|show|see|view|get|share)\b",
+
+    # "Can I see the hoodie?"
+    # This intentionally requires "see/view" to be followed by an actual
+    # object/context rather than matching every "can I see..." statement.
+    r"\bcan\s+i\s+(?:see|view)\s+"
+    r"(?:it|that|this|the\s+\w+|your\s+\w+|a\s+\w+|an\s+\w+)\b",
+
+    # "Could I see the hoodie?"
+    r"\bcould\s+i\s+(?:see|view)\s+"
+    r"(?:it|that|this|the\s+\w+|your\s+\w+|a\s+\w+|an\s+\w+)\b",
+
+    # "Let me see the hoodie"
+    r"\b(?:let|allow)\s+me\s+(?:see|view)\s+"
+    r"(?:it|that|this|the\s+\w+|your\s+\w+|a\s+\w+|an\s+\w+)\b",
+
+    # "I want to see the hoodie"
+    r"\bi\s+(?:want|would\s+like|d['’]like)\s+to\s+(?:see|view)\s+"
+    r"(?:it|that|this|the\s+\w+|your\s+\w+|a\s+\w+|an\s+\w+)\b",
+
+    # "What does the hoodie look like?"
+    r"\bwhat\s+(?:does|do)\b.{0,60}\b"
+    r"(?:look\s+like|looks\s+like)\b",
+
+    # "Can you show me the hoodie?"
+    r"\bcan\s+you\s+show\s+me\b.{0,50}\b"
+    r"(?:the|this|that|your|a|an)\b",
+
+    # "Could you show me the hoodie?"
+    r"\bcould\s+you\s+show\s+me\b.{0,50}\b"
+    r"(?:the|this|that|your|a|an)\b",
+
+    # "Can you send the hoodie?"
+    #
+    # This pattern is deliberately NOT enough by itself to send an image
+    # unless the message also contains an image-related word.
+    r"\bcan\s+you\s+send\b.{0,40}\b"
+    r"(?:photo|picture|pic|image|images|photos|pictures)\b",
+
+    # Explicit "show me a photo/picture/image"
+    r"\bshow\s+me\b.{0,50}\b"
+    r"(?:photo|picture|pic|image|images|photos|pictures)\b",
+
+    # Explicit "show me what it looks like"
+    r"\bshow\s+me\b.{0,50}\b"
+    r"(?:what\s+it\s+looks\s+like|what\s+that\s+looks\s+like)\b",
 )
 
 
 def _is_product_image_request(text: str | None) -> bool:
-    """Return True when the customer explicitly asks to see a product image.
+    """Return True only when the customer explicitly requests a product image.
 
-    This is deliberately conservative enough to avoid sending product
-    images for ordinary product questions such as:
+    The function intentionally avoids broad patterns such as:
 
-        "Do you have a black hoodie?"
+        "show me"
+        "let me see"
+        "can you show"
 
-    while recognizing requests such as:
+    by themselves because those phrases can also refer to prices, sizes,
+    colors, product details, availability, etc.
 
-        "Send me the hoodie picture."
-        "Can I see the black hoodie?"
-        "Show me the image."
+    Examples that should return True:
+
+        "Send me a picture of the hoodie."
+        "Show me an image of the black hoodie."
+        "Can I see the hoodie?"
+        "Could I see the red sneakers?"
         "What does the hoodie look like?"
+        "Show me a photo of the product."
+
+    Examples that should return False:
+
+        "How much is the hoodie?"
+        "Do you have a black hoodie?"
+        "Show me the price."
+        "Show me available sizes."
+        "Can you show me the price?"
+        "Is the hoodie available?"
     """
 
     if not text:
@@ -184,10 +247,11 @@ def _normalize_product_search_text(
         str(text).strip().lower().split()
     )
 
-    # Remove common request phrases.
     replacements = (
         r"\bcan\s+you\b",
         r"\bcould\s+you\b",
+        r"\bcan\s+i\b",
+        r"\bcould\s+i\b",
         r"\bplease\b",
         r"\bkindly\b",
         r"\bsend\s+me\b",
@@ -197,11 +261,13 @@ def _normalize_product_search_text(
         r"\bshare\s+with\s+me\b",
         r"\bshare\b",
         r"\blet\s+me\s+see\b",
+        r"\ballow\s+me\s+to\s+see\b",
         r"\bi\s+want\s+to\s+see\b",
-        r"\bi'd\s+like\s+to\s+see\b",
+        r"\bi['’]d\s+like\s+to\s+see\b",
         r"\bi\s+would\s+like\s+to\s+see\b",
         r"\bcan\s+i\s+see\b",
         r"\bcould\s+i\s+see\b",
+        r"\bwhat\s+(?:does|do)\b",
         r"\bphoto\s+of\b",
         r"\bpicture\s+of\b",
         r"\bpic\s+of\b",
@@ -215,7 +281,8 @@ def _normalize_product_search_text(
         r"\bimages?\b",
         r"\bphotos?\b",
         r"\bpictures?\b",
-        r"\bshowing\b",
+        r"\bwhat\s+it\s+looks\s+like\b",
+        r"\bwhat\s+that\s+looks\s+like\b",
         r"\blook\s+like\b",
     )
 
@@ -929,9 +996,12 @@ class MessagingPipeline:
             #
             # IMPORTANT:
             #
-            # This is application-level intent detection. It does not ask
-            # Gemini to send an image. The backend will send the image
-            # through the platform adapter after the AI text response.
+            # This is application-level intent detection.
+            #
+            # The LLM does NOT physically send the image.
+            #
+            # The backend sends the image through the platform adapter only
+            # after the AI text response has been successfully sent.
             # ----------------------------------------------------------------
 
             wants_product_image = (
@@ -1151,58 +1221,65 @@ class MessagingPipeline:
                 return
 
             # ----------------------------------------------------------------
-            # 14. Send requested/relevant product image
+            # 14. Send product image ONLY when explicitly requested
+            # ----------------------------------------------------------------
+            #
+            # IMPORTANT PRODUCTION RULE:
+            #
+            # top_product is useful for AI/product context.
+            #
+            # It MUST NOT be used as a reason to send an image.
+            #
+            # Therefore:
+            #
+            #     wants_product_image
+            #             AND
+            #     requested_product exists
+            #             AND
+            #     requested_product has an image
+            #
+            # are ALL required.
+            #
+            # This prevents:
+            #
+            # "How much is the hoodie?"
+            #
+            # from sending:
+            #
+            # "hoodie.jpg"
+            #
+            # while still allowing:
+            #
+            # "Send me a picture of the hoodie."
+            #
+            # to send the image.
             # ----------------------------------------------------------------
 
-            #
-            # Priority:
-            #
-            #   1. Explicitly requested product with image.
-            #   2. Normal top semantic product with image.
-            #
-            # Explicit image requests DO NOT require the 0.5 semantic
-            # threshold once a product has been identified.
-            #
-
-            product_to_send = None
-
             if (
-                requested_product is not None
+                wants_product_image
+                and requested_product is not None
                 and _product_has_image(
                     requested_product
                 )
             ):
-                product_to_send = (
-                    requested_product
-                )
-
-            elif (
-                top_product is not None
-                and _product_has_image(
-                    top_product
-                )
-            ):
-                product_to_send = top_product
-
-            if product_to_send is not None:
                 try:
                     image_url = (
-                        product_to_send.images[0]
+                        requested_product.images[0]
                     )
 
                     caption = (
                         _build_product_photo_caption(
-                            product_to_send
+                            requested_product
                         )
                     )
 
                     logger.info(
                         (
-                            "Sending product image: conversation=%s "
-                            "product=%s image_url=%s"
+                            "Sending explicitly requested product image: "
+                            "conversation=%s product=%s image_url=%s"
                         ),
                         conversation.id,
-                        product_to_send.id,
+                        requested_product.id,
                         image_url,
                     )
 
@@ -1214,29 +1291,29 @@ class MessagingPipeline:
 
                     logger.info(
                         (
-                            "Product image sent successfully: "
+                            "Requested product image sent successfully: "
                             "conversation=%s product=%s"
                         ),
                         conversation.id,
-                        product_to_send.id,
+                        requested_product.id,
                     )
 
                 except Exception:
                     logger.warning(
                         (
-                            "Failed to send product photo for "
-                            "product %s"
+                            "Failed to send requested product photo "
+                            "for product %s"
                         ),
-                        product_to_send.id,
+                        requested_product.id,
                         exc_info=True,
                     )
 
             elif wants_product_image:
                 logger.info(
                     (
-                        "Customer requested a product image, but no "
-                        "matching product with an image was found: "
-                        "conversation=%s"
+                        "Customer explicitly requested a product image, "
+                        "but no matching product with a usable image "
+                        "was found: conversation=%s"
                     ),
                     conversation.id,
                 )
@@ -1529,6 +1606,11 @@ class MessagingPipeline:
 
             # ---------------------------------------------------------------
             # Payment receipt detection.
+            #
+            # IMPORTANT:
+            #
+            # Classification alone does NOT confirm payment.
+            # The actual payment still needs verification.
             # ---------------------------------------------------------------
 
             if customer is not None:
@@ -1873,16 +1955,29 @@ class MessagingPipeline:
         owner_id,
         query: str | None,
     ) -> Product | None:
-        """Find the product the customer is asking to see.
+        """Find the product the customer is explicitly asking to see.
 
         Product search is attempted twice:
 
         1. Original customer wording.
         2. Cleaned product wording with image-request language removed.
 
-        This improves matching for messages such as:
+        IMPORTANT:
 
-            "Can you send me a picture of the black hoodie?"
+        This method selects the best matching product first.
+
+        It does NOT silently replace a matching product without an image
+        with an unrelated product that happens to have an image.
+
+        That prevents this bad behavior:
+
+            Customer asks for Product A.
+            Product A has no image.
+            Search also finds Product B with an image.
+            System sends Product B.
+
+        Instead, if the requested product has no image, no product image
+        is sent.
         """
 
         if not query:
@@ -1943,11 +2038,6 @@ class MessagingPipeline:
                 if product is None:
                     continue
 
-                if not _product_has_image(
-                    product
-                ):
-                    continue
-
                 numeric_score = float(
                     score or 0
                 )
@@ -1956,8 +2046,12 @@ class MessagingPipeline:
                     best_score = numeric_score
                     best_product = product
 
-            # If the cleaned query gives a product with a usable image,
-            # prefer it over an unrelated high-scoring original query result.
+            # The cleaned query is normally more useful because it removes
+            # words such as "send", "photo", "show", etc.
+            #
+            # Once we have a result from the cleaned query, we prefer that
+            # product rather than continuing into potentially unrelated
+            # matches from the original sentence.
             if (
                 cleaned
                 and search_query == cleaned
@@ -1969,11 +2063,12 @@ class MessagingPipeline:
             logger.info(
                 (
                     "Requested product matched: product=%s "
-                    "score=%s query=%s"
+                    "score=%s query=%s has_image=%s"
                 ),
                 best_product.id,
                 best_score,
                 query,
+                _product_has_image(best_product),
             )
 
         return best_product
@@ -2004,6 +2099,18 @@ class MessagingPipeline:
             reply_text
             top_semantic_product
             explicitly_requested_product
+
+        IMPORTANT:
+
+        `top_semantic_product` is contextual information for the AI.
+
+        It is NOT a signal to send a product image.
+
+        Product-image delivery is controlled exclusively by:
+
+            wants_product_image
+            requested_product
+            _product_has_image(requested_product)
         """
 
         if not effective_text:
@@ -2044,6 +2151,10 @@ class MessagingPipeline:
 
         # -------------------------------------------------------------------
         # Product search
+        #
+        # This is ALWAYS allowed for product-related questions.
+        #
+        # However, product search alone NEVER causes an image to be sent.
         # -------------------------------------------------------------------
 
         product_results = (
@@ -2056,6 +2167,9 @@ class MessagingPipeline:
 
         # -------------------------------------------------------------------
         # Explicit requested product.
+        #
+        # Only perform the extra requested-product lookup when the customer
+        # actually requested an image.
         # -------------------------------------------------------------------
 
         requested_product = None
@@ -2093,28 +2207,53 @@ class MessagingPipeline:
         )
 
         # -------------------------------------------------------------------
-        # Give the model an explicit instruction for image requests.
+        # Messaging capability instruction
         #
-        # This prevents the model from saying:
+        # This is important because Gemini may otherwise believe that it
+        # physically controls the messaging platform.
         #
-        # "I wish I could send an image."
+        # The backend is responsible for sending product images.
+        # -------------------------------------------------------------------
+
+        messaging_capability_instruction = """
+Messaging capabilities:
+
+- You are operating inside a customer messaging platform.
+- The application can send product images separately from your text reply.
+- Do not say that you cannot send images.
+- Do not say that the chat system does not support images.
+- Do not say that you wish you could send a photo.
+- Do not invent an image URL.
+- Do not claim that an image was delivered unless the application has
+  actually sent it.
+- For normal product questions, answer normally and do not suggest that
+  an image will be sent unless the customer explicitly asked to see one.
+""".strip()
+
+        system_instruction = (
+            f"{system_instruction}\n\n"
+            f"{messaging_capability_instruction}"
+        ).strip()
+
+        # -------------------------------------------------------------------
+        # Explicit product image request.
         #
-        # The actual image is still sent by the backend.
+        # The backend sends the image separately.
+        #
+        # Gemini only needs to produce natural text.
         # -------------------------------------------------------------------
 
         if requested_product is not None:
             system_instruction = (
                 f"{system_instruction}\n\n"
                 "PRODUCT IMAGE REQUEST:\n"
-                "The customer has requested to see a product image. "
-                "The application will send the actual product image "
-                "separately after your text response. Do NOT say that "
-                "you cannot send images, do NOT claim that the chat system "
-                "does not support images, and do NOT tell the customer "
-                "that you wish you could send a photo. Respond naturally "
-                "and briefly acknowledge that the requested product image "
-                "is being shown.\n"
-                f"Product being shown: {requested_product.name}"
+                "The customer has explicitly requested to see a product "
+                "image. The application will attempt to send the matching "
+                "product image separately after your text response. "
+                "Respond naturally and briefly. Do not say that you cannot "
+                "send images. Do not claim that the image has already been "
+                "delivered. Do not invent an image URL or attachment.\n"
+                f"Requested product: {requested_product.name}"
             )
 
         # -------------------------------------------------------------------
@@ -2178,26 +2317,31 @@ class MessagingPipeline:
             )
 
         # -------------------------------------------------------------------
-        # Normal semantic product decision.
+        # Normal semantic product context.
+        #
+        # IMPORTANT:
+        #
+        # This does NOT mean an image should be sent.
+        #
+        # It simply identifies the most relevant product for the AI's
+        # response/context.
         # -------------------------------------------------------------------
 
         top_product = None
 
         if product_results:
-            best_product, best_score = (
+            best_product, _best_score = (
                 product_results[0]
             )
 
-            if (
-                best_product is not None
-                and best_score >= PRODUCT_PHOTO_MIN_SCORE
-                and _product_has_image(
-                    best_product
-                )
-            ):
+            if best_product is not None:
                 top_product = best_product
 
-        # Explicit request takes priority.
+        # -------------------------------------------------------------------
+        # Explicit image request takes priority for requested-product
+        # context.
+        # -------------------------------------------------------------------
+
         if requested_product is not None:
             top_product = requested_product
 
