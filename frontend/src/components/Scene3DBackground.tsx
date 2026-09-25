@@ -16,7 +16,7 @@ import * as THREE from "three";
  *   - No GLB/GLTF downloads
  *   - Procedurally generated humanoid AI agents
  *   - Floating / breathing / rotating animation
- *   - Glowing chest cores
+ *   - Glowing chest AI cores
  *   - Orbital rings
  *   - Neural connection lines
  *   - Ambient particles
@@ -27,10 +27,9 @@ import * as THREE from "three";
  *   - StrictMode-safe cleanup
  *   - Renderer.forceContextLoss()
  *
- * IMPORTANT:
- * This is intentionally a stylized futuristic 3D scene rather than
- * photorealistic human models. Realistic humanoid characters would
- * require external GLB/GLTF assets or a much heavier character system.
+ * This is a stylized futuristic 3D scene rather than a
+ * photorealistic humanoid model. Realistic characters would
+ * require external GLB/GLTF assets.
  */
 
 type AgentConfig = {
@@ -59,7 +58,7 @@ const AGENTS: AgentConfig[] = [
   {
     name: "Personal",
     position: new THREE.Vector3(-5.4, 2.2, 0.2),
-    scale: 1.0,
+    scale: 1,
     phase: 0,
     orbitRadius: 0.12,
     color: 0x8b5cf6,
@@ -74,15 +73,15 @@ const AGENTS: AgentConfig[] = [
   },
   {
     name: "Support",
-    position: new THREE.Vector3(-5.0, -2.8, -0.2),
+    position: new THREE.Vector3(-5, -2.8, -0.2),
     scale: 0.92,
-    phase: 4.0,
+    phase: 4,
     orbitRadius: 0.14,
     color: 0x22c55e,
   },
   {
     name: "Opportunity",
-    position: new THREE.Vector3(5.0, -2.6, 0.4),
+    position: new THREE.Vector3(5, -2.6, 0.4),
     scale: 0.92,
     phase: 5.3,
     orbitRadius: 0.18,
@@ -105,7 +104,6 @@ export default function Scene3DBackground() {
     }
 
     let renderer: THREE.WebGLRenderer | null = null;
-
     let frameId: number | null = null;
 
     let disposed = false;
@@ -179,7 +177,6 @@ export default function Scene3DBackground() {
 
       const handleContextLost = (event: Event) => {
         event.preventDefault();
-
         contextLost = true;
       };
 
@@ -266,7 +263,7 @@ export default function Scene3DBackground() {
       scene.add(centralSystem.group);
 
       // ------------------------------------------------------------
-      // Neural network connections
+      // Neural connections
       // ------------------------------------------------------------
 
       const connectionGroup = createConnections();
@@ -291,12 +288,13 @@ export default function Scene3DBackground() {
       // Ambient particles
       // ------------------------------------------------------------
 
-      const particleSystem = createAmbientParticles();
+      const particleSystem =
+        createAmbientParticles();
 
       scene.add(particleSystem);
 
       // ------------------------------------------------------------
-      // Floor / subtle grid
+      // Environment grid
       // ------------------------------------------------------------
 
       const grid = createEnvironmentGrid();
@@ -304,23 +302,20 @@ export default function Scene3DBackground() {
       scene.add(grid);
 
       // ------------------------------------------------------------
-      // Clock
+      // Animation
       // ------------------------------------------------------------
 
       const clock = new THREE.Clock();
 
       let elapsed = 0;
 
-      // ------------------------------------------------------------
-      // Animation
-      // ------------------------------------------------------------
-
       const animate = () => {
         if (disposed) {
           return;
         }
 
-        frameId = window.requestAnimationFrame(animate);
+        frameId =
+          window.requestAnimationFrame(animate);
 
         if (contextLost || !renderer) {
           return;
@@ -335,10 +330,7 @@ export default function Scene3DBackground() {
           elapsed += delta;
 
           if (!prefersReducedMotion) {
-            // ------------------------------------------------------
             // Central AI core
-            // ------------------------------------------------------
-
             centralSystem.group.rotation.y =
               elapsed * 0.18;
 
@@ -357,10 +349,7 @@ export default function Scene3DBackground() {
               5 +
               Math.sin(elapsed * 2.1) * 1.4;
 
-            // ------------------------------------------------------
             // Agents
-            // ------------------------------------------------------
-
             agents.forEach((agent, index) => {
               const phase = agent.phase;
 
@@ -375,57 +364,55 @@ export default function Scene3DBackground() {
                 ) * 0.08;
 
               agent.root.position.y =
-                agent.baseY +
-                float;
+                agent.baseY + float;
 
               agent.root.position.x +=
                 Math.sin(
                   elapsed * 0.22 + phase,
-                ) *
-                0.0015;
+                ) * 0.0015;
+
+              agent.root.position.z =
+                Math.sin(
+                  elapsed * 0.28 + phase,
+                ) * agent.orbitRadius;
 
               agent.root.rotation.y =
                 Math.sin(
                   elapsed * 0.45 + phase,
-                ) *
-                0.12;
+                ) * 0.12;
 
               agent.root.rotation.z =
                 Math.sin(
                   elapsed * 0.55 + phase,
-                ) *
-                0.025;
+                ) * 0.025;
 
-              // Gentle body breathing
+              // Breathing
               const breathing =
                 1 +
                 Math.sin(
                   elapsed * 1.2 + phase,
-                ) *
-                  0.018;
+                ) * 0.018;
 
-              agent.body.scale.y = breathing;
+              agent.body.scale.y =
+                breathing;
 
               // Head movement
               agent.head.rotation.y =
                 Math.sin(
                   elapsed * 0.5 + phase,
-                ) *
-                0.12;
+                ) * 0.12;
 
               agent.head.rotation.x =
                 Math.sin(
                   elapsed * 0.7 + phase,
-                ) *
-                0.04;
+                ) * 0.04;
 
-              // Chest AI core
+              // Chest core pulse
               const pulse =
                 1 +
                 Math.sin(
                   elapsed * 2.5 + phase,
-                ) *
-                  0.16;
+                ) * 0.16;
 
               agent.core.scale.setScalar(
                 pulse,
@@ -435,47 +422,32 @@ export default function Scene3DBackground() {
                 1.8 +
                 Math.sin(
                   elapsed * 2.5 + phase,
-                ) *
-                  0.7;
+                ) * 0.7;
 
-              // Orbiting rings
+              // Orbit rings
               agent.rings.rotation.z =
                 elapsed *
-                  (index % 2 === 0
-                    ? 0.4
-                    : -0.35);
+                (index % 2 === 0
+                  ? 0.4
+                  : -0.35);
 
               agent.rings.rotation.x =
                 Math.sin(
                   elapsed * 0.35 + phase,
-                ) *
-                0.25;
+                ) * 0.25;
 
-              // Tiny particle motion
+              // Agent particles
               agent.particles.rotation.y =
                 elapsed * 0.12;
 
               agent.particles.rotation.x =
                 elapsed * 0.06;
 
-              // Slight orbital movement
-              if (agent.orbitRadius > 0) {
-                agent.root.position.z =
-                  Math.sin(
-                    elapsed * 0.28 + phase,
-                  ) *
-                  agent.orbitRadius;
-              }
-
-              // Avoid unused animation drift
               agent.root.position.y +=
                 secondaryFloat * 0.15;
             });
 
-            // ------------------------------------------------------
             // Connections
-            // ------------------------------------------------------
-
             connectionGroup.rotation.y =
               Math.sin(elapsed * 0.12) *
               0.05;
@@ -484,10 +456,7 @@ export default function Scene3DBackground() {
               Math.sin(elapsed * 0.09) *
               0.025;
 
-            // ------------------------------------------------------
-            // Particles
-            // ------------------------------------------------------
-
+            // Ambient particles
             particleSystem.rotation.y =
               elapsed * 0.025;
 
@@ -495,10 +464,7 @@ export default function Scene3DBackground() {
               Math.sin(elapsed * 0.06) *
               0.05;
 
-            // ------------------------------------------------------
-            // Camera breathing
-            // ------------------------------------------------------
-
+            // Camera
             camera.position.x =
               Math.sin(elapsed * 0.08) *
               0.18;
@@ -510,14 +476,8 @@ export default function Scene3DBackground() {
             camera.lookAt(0, 0, 0);
           }
 
-          renderer.render(
-            scene,
-            camera,
-          );
+          renderer.render(scene, camera);
         } catch {
-          // Rendering must NEVER be allowed to crash
-          // the authentication page.
-
           disposed = true;
 
           if (frameId !== null) {
@@ -616,6 +576,7 @@ export default function Scene3DBackground() {
           },
         );
 
+        // Dispose every Three.js object.
         disposeObject3D(scene);
 
         if (renderer) {
@@ -661,6 +622,8 @@ export default function Scene3DBackground() {
         window.cancelAnimationFrame(
           frameId,
         );
+
+        frameId = null;
       }
 
       cleanupCallbacks.forEach(
@@ -675,23 +638,15 @@ export default function Scene3DBackground() {
 
       if (renderer) {
         try {
-          disposeObject3D(
-            renderer.scene ?? new THREE.Scene(),
-          );
-        } catch {
-          // Not available / already broken.
-        }
-
-        try {
           renderer.forceContextLoss();
         } catch {
-          // Already lost.
+          // Context may already be lost.
         }
 
         try {
           renderer.dispose();
         } catch {
-          // Already disposed.
+          // Renderer may already be disposed.
         }
 
         if (
@@ -710,8 +665,8 @@ export default function Scene3DBackground() {
         renderer = null;
       }
 
-      // A decorative background should silently
-      // disappear if WebGL initialization fails.
+      // Never allow a decorative 3D scene
+      // to break authentication.
       return undefined;
     }
   }, []);
@@ -741,7 +696,7 @@ export default function Scene3DBackground() {
 }
 
 /* ================================================================
-   AGENT CREATION
+   AGENT
    ================================================================ */
 
 function createAgent(
@@ -757,7 +712,8 @@ function createAgent(
     config.scale,
   );
 
-  const body = new THREE.Group();
+  const body =
+    new THREE.Group();
 
   root.add(body);
 
@@ -817,16 +773,20 @@ function createAgent(
     0.55,
   );
 
-  const torso = new THREE.Mesh(
-    torsoGeometry,
-    bodyMaterial,
-  );
+  const torso =
+    new THREE.Mesh(
+      torsoGeometry,
+      bodyMaterial,
+    );
 
   torso.position.y = -0.65;
 
   body.add(torso);
 
-  // Inner chest plate
+  // --------------------------------------------------------------
+  // Chest plate
+  // --------------------------------------------------------------
+
   const chestGeometry =
     new THREE.SphereGeometry(
       0.65,
@@ -883,7 +843,7 @@ function createAgent(
       config.color,
       2.2,
       3.5,
-           2,
+      2,
     );
 
   coreLight.position.copy(
@@ -918,7 +878,8 @@ function createAgent(
   // Head
   // --------------------------------------------------------------
 
-  const head = new THREE.Group();
+  const head =
+    new THREE.Group();
 
   head.position.set(
     0,
@@ -1034,7 +995,6 @@ function createAgent(
   head.add(leftEye);
   head.add(rightEye);
 
-  // Eye glow
   const eyeLight =
     new THREE.PointLight(
       config.color,
@@ -1052,7 +1012,7 @@ function createAgent(
   head.add(eyeLight);
 
   // --------------------------------------------------------------
-  // Head crown
+  // Crown
   // --------------------------------------------------------------
 
   const crownGeometry =
@@ -1311,7 +1271,7 @@ function createAgent(
   body.add(rightFoot);
 
   // --------------------------------------------------------------
-  // Agent platform
+  // Platform
   // --------------------------------------------------------------
 
   const platformGeometry =
@@ -1342,7 +1302,10 @@ function createAgent(
 
   root.add(platform);
 
-  // Platform glow ring
+  // --------------------------------------------------------------
+  // Platform glow
+  // --------------------------------------------------------------
+
   const platformRingGeometry =
     new THREE.TorusGeometry(
       1.05,
@@ -1366,7 +1329,7 @@ function createAgent(
   root.add(platformRing);
 
   // --------------------------------------------------------------
-  // Orbit rings around agent
+  // Agent orbit rings
   // --------------------------------------------------------------
 
   const rings =
@@ -1419,7 +1382,7 @@ function createAgent(
   root.add(rings);
 
   // --------------------------------------------------------------
-  // Small orbit particles
+  // Agent particles
   // --------------------------------------------------------------
 
   const particleCount = 16;
@@ -1504,17 +1467,14 @@ function createAgent(
 }
 
 /* ================================================================
-   CENTRAL AI SYSTEM
+   CENTRAL AI
    ================================================================ */
 
 function createCentralAI() {
   const group =
     new THREE.Group();
 
-  // --------------------------------------------------------------
   // Main core
-  // --------------------------------------------------------------
-
   const coreGeometry =
     new THREE.IcosahedronGeometry(
       0.85,
@@ -1542,10 +1502,7 @@ function createCentralAI() {
 
   group.add(core);
 
-  // --------------------------------------------------------------
   // Inner core
-  // --------------------------------------------------------------
-
   const innerGeometry =
     new THREE.IcosahedronGeometry(
       0.42,
@@ -1567,10 +1524,7 @@ function createCentralAI() {
 
   group.add(inner);
 
-  // --------------------------------------------------------------
   // Outer rings
-  // --------------------------------------------------------------
-
   const ringMaterial =
     new THREE.MeshBasicMaterial({
       color: 0x8b5cf6,
@@ -1603,7 +1557,7 @@ function createCentralAI() {
   const ring3 =
     new THREE.Mesh(
       new THREE.TorusGeometry(
-        2.0,
+        2,
         0.009,
         8,
         72,
@@ -1630,10 +1584,7 @@ function createCentralAI() {
   group.add(ring2);
   group.add(ring3);
 
-  // --------------------------------------------------------------
   // Core light
-  // --------------------------------------------------------------
-
   const coreLight =
     new THREE.PointLight(
       0x8b5cf6,
@@ -1662,14 +1613,15 @@ function createConnections() {
   const points = [
     [-5.4, 2.2, 0.2],
     [5.1, 2.6, -0.4],
-    [-5.0, -2.8, -0.2],
-    [5.0, -2.6, 0.4],
+    [-5, -2.8, -0.2],
+    [5, -2.6, 0.4],
   ];
 
   const center = [0, 0, 0];
 
   const positions: number[] = [];
 
+  // Agent -> central AI
   for (const point of points) {
     positions.push(
       point[0],
@@ -1681,7 +1633,7 @@ function createConnections() {
     );
   }
 
-  // Cross-connections between agents
+  // Agent -> agent
   const crossPairs = [
     [0, 1],
     [0, 2],
@@ -1726,7 +1678,7 @@ function createConnections() {
 
   group.add(lines);
 
-  // Moving data pulses
+  // Data pulses
   const pulsePositions =
     new Float32Array(
       12 * 3,
@@ -1737,23 +1689,18 @@ function createConnections() {
     i < 12;
     i++
   ) {
-    pulsePositions[
-      i * 3
-    ] =
-      (Math.random() - 0.5) *
-      9;
+    pulsePositions[i * 3] =
+      (Math.random() - 0.5) * 9;
 
     pulsePositions[
       i * 3 + 1
     ] =
-      (Math.random() - 0.5) *
-      6;
+      (Math.random() - 0.5) * 6;
 
     pulsePositions[
       i * 3 + 2
     ] =
-      (Math.random() - 0.5) *
-      2;
+      (Math.random() - 0.5) * 2;
   }
 
   const pulseGeometry =
@@ -1879,7 +1826,6 @@ function createEnvironmentGrid() {
 
   const size = 24;
   const divisions = 24;
-
   const step =
     size / divisions;
 
@@ -1938,7 +1884,7 @@ function createEnvironmentGrid() {
 }
 
 /* ================================================================
-   DISPOSAL
+   THREE.JS DISPOSAL
    ================================================================ */
 
 function disposeObject3D(
