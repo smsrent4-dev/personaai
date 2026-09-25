@@ -59,11 +59,6 @@ class Settings(BaseSettings):
 
     DATABASE_URL_SYNC: str
 
-    # Local PostgreSQL defaults.
-    #
-    # These are mainly useful for local Docker development.
-    # Production deployments should provide DATABASE_URL and
-    # DATABASE_URL_SYNC through environment variables.
     POSTGRES_USER: str = "personaai"
 
     POSTGRES_PASSWORD: str = "personaai"
@@ -76,14 +71,6 @@ class Settings(BaseSettings):
 
     REDIS_URL: str = "redis://redis:6379/0"
 
-    # Production:
-    #     false
-    #
-    # Tests:
-    #     tests/conftest.py can override this to true.
-    #
-    # When false, incoming messages are sent to Celery instead of being
-    # executed inside the API request process.
     CELERY_TASK_ALWAYS_EAGER: bool = False
 
     # =========================================================================
@@ -106,17 +93,8 @@ class Settings(BaseSettings):
     # FRONTEND / API URLS
     # =========================================================================
 
-    # Frontend URL used for redirects, CORS-related logic, OAuth callbacks,
-    # and other server-side URL generation.
     FRONTEND_URL: str = "http://localhost:5173"
 
-    # Public backend URL.
-    #
-    # In production this should be the publicly reachable HTTPS URL of
-    # the PersonaAI backend.
-    #
-    # Example:
-    # https://your-backend-domain.com
     API_BASE_URL: str = "http://localhost:8000"
 
     # =========================================================================
@@ -128,47 +106,66 @@ class Settings(BaseSettings):
     # Gemini API key.
     #
     # Production:
-    # Set GEMINI_API_KEY in Railway/Render environment variables.
+    # Configure GEMINI_API_KEY in Railway/Render environment variables.
     GEMINI_API_KEY: str = ""
 
     # Primary Gemini generation model.
-    #
-    # This can be overridden without changing the source code:
-    #
-    # GEMINI_MODEL=...
-    #
-    # Keep this environment-driven in production because Google can
-    # retire or replace model IDs over time.
     GEMINI_MODEL: str = "gemini-3.6-flash"
 
     # Optional fallback Gemini generation model.
-    #
-    # Leave empty if no verified fallback model is configured.
-    #
-    # Example:
-    # GEMINI_FALLBACK_MODEL=some-supported-model
-    #
-    # The Gemini provider will only use this after the primary model
-    # experiences a retryable service failure.
     GEMINI_FALLBACK_MODEL: str = ""
 
     # Gemini embedding model.
-    #
-    # The current PersonaAI vector database schema uses 768 dimensions.
     GEMINI_EMBEDDING_MODEL: str = "gemini-embedding-001"
 
-    # Must match the pgvector column dimension used by PersonaAI.
+    # Must match the pgvector column dimension.
     EMBEDDING_DIMENSIONS: int = 768
 
     # =========================================================================
     # KNOWLEDGE BASE / FILE STORAGE
     # =========================================================================
 
+    # Supported:
+    #
+    # local
+    # cloudinary
+    #
+    # Development can use:
+    # STORAGE_BACKEND=local
+    #
+    # Production should use:
+    # STORAGE_BACKEND=cloudinary
     STORAGE_BACKEND: str = "local"
 
+    # Used by LocalStorageBackend.
     STORAGE_DIR: str = "./storage"
 
+    # Maximum application-level upload size.
+    #
+    # Product images currently have their own 10 MB limit in
+    # ProductService.
     MAX_UPLOAD_SIZE_MB: int = 25
+
+    # -------------------------------------------------------------------------
+    # CLOUDINARY
+    # -------------------------------------------------------------------------
+    #
+    # These values must ONLY exist on the backend.
+    #
+    # NEVER put CLOUDINARY_API_SECRET in the React/Vite frontend.
+    #
+    # Railway example:
+    #
+    # STORAGE_BACKEND=cloudinary
+    # CLOUDINARY_CLOUD_NAME=...
+    # CLOUDINARY_API_KEY=...
+    # CLOUDINARY_API_SECRET=...
+
+    CLOUDINARY_CLOUD_NAME: str = ""
+
+    CLOUDINARY_API_KEY: str = ""
+
+    CLOUDINARY_API_SECRET: str = ""
 
     # =========================================================================
     # TELEGRAM
@@ -183,26 +180,18 @@ class Settings(BaseSettings):
     # WHATSAPP CLOUD API / META
     # =========================================================================
 
-    # Meta application credentials used by WhatsApp Embedded Signup.
     META_APP_ID: str = ""
 
     META_APP_SECRET: str = ""
 
-    # Embedded Signup configuration ID.
     META_CONFIG_ID: str = ""
 
-    # Meta Graph API version.
     META_GRAPH_API_VERSION: str = "v25.0"
 
-    # OAuth callback URL used by the frontend/backend WhatsApp connection
-    # flow.
     META_OAUTH_REDIRECT_URI: str = (
         "http://localhost:5173/integrations/whatsapp/callback"
     )
 
-    # Meta WhatsApp webhook verification token.
-    #
-    # This is configured at the Meta App webhook level.
     WHATSAPP_APP_VERIFY_TOKEN: str = ""
 
     # =========================================================================
@@ -219,18 +208,6 @@ class Settings(BaseSettings):
     # CORS
     # =========================================================================
 
-    # Local-development defaults.
-    #
-    # In production, override this environment variable with the actual
-    # frontend origin(s).
-    #
-    # Pydantic can parse JSON such as:
-    #
-    # CORS_ORIGINS=["https://your-frontend.com"]
-    #
-    # or a JSON string in an environment variable:
-    #
-    # CORS_ORIGINS='["https://your-frontend.com"]'
     CORS_ORIGINS: List[str] = [
         "http://localhost:5173",
         "http://localhost:3000",
