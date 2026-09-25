@@ -20,13 +20,15 @@ interface DataPacket {
   end: THREE.Vector3;
   progress: number;
   speed: number;
+  point: THREE.Vector3;
+  tail: THREE.Vector3;
 }
 
 interface Panel {
   group: THREE.Group;
-  angle: number;
-  radius: number;
   phase: number;
+  baseY: number;
+  baseScale: number;
 }
 
 const COLORS = {
@@ -44,10 +46,22 @@ const AGENTS: Array<{
   name: AgentName;
   color: number;
 }> = [
-  { name: "PERSONAL", color: COLORS.cyan },
-  { name: "SALES", color: COLORS.violet },
-  { name: "SUPPORT", color: COLORS.blue },
-  { name: "OPPORTUNITY", color: COLORS.green },
+  {
+    name: "PERSONAL",
+    color: COLORS.cyan,
+  },
+  {
+    name: "SALES",
+    color: COLORS.violet,
+  },
+  {
+    name: "SUPPORT",
+    color: COLORS.blue,
+  },
+  {
+    name: "OPPORTUNITY",
+    color: COLORS.green,
+  },
 ];
 
 function isWebGLAvailable(): boolean {
@@ -86,29 +100,33 @@ function disposeMaterial(material: THREE.Material): void {
 
   const uniqueTextures = new Set<THREE.Texture>();
 
-  textures.forEach((texture) => {
+  for (const texture of textures) {
     if (texture) {
       uniqueTextures.add(texture);
     }
-  });
+  }
 
-  uniqueTextures.forEach((texture) => texture.dispose());
+  for (const texture of uniqueTextures) {
+    texture.dispose();
+  }
 
   material.dispose();
 }
 
 function disposeObject3D(root: THREE.Object3D): void {
   root.traverse((object) => {
-    const mesh = object as THREE.Mesh;
+    const drawable = object as THREE.Mesh;
 
-    if (mesh.geometry) {
-      mesh.geometry.dispose();
+    if (drawable.geometry) {
+      drawable.geometry.dispose();
     }
 
-    const material = mesh.material;
+    const material = drawable.material;
 
     if (Array.isArray(material)) {
-      material.forEach(disposeMaterial);
+      for (const item of material) {
+        disposeMaterial(item);
+      }
     } else if (material) {
       disposeMaterial(material);
     }
@@ -179,8 +197,13 @@ function createPanel(
 ): THREE.Group {
   const group = new THREE.Group();
 
+  const backgroundGeometry = new THREE.PlaneGeometry(
+    width,
+    height
+  );
+
   const background = new THREE.Mesh(
-    new THREE.PlaneGeometry(width, height),
+    backgroundGeometry,
     new THREE.MeshBasicMaterial({
       color: COLORS.dark,
       transparent: true,
@@ -192,8 +215,12 @@ function createPanel(
 
   group.add(background);
 
+  const borderGeometry = new THREE.EdgesGeometry(
+    backgroundGeometry
+  );
+
   const border = new THREE.LineSegments(
-    new THREE.EdgesGeometry(new THREE.PlaneGeometry(width, height)),
+    borderGeometry,
     new THREE.LineBasicMaterial({
       color,
       transparent: true,
@@ -215,10 +242,15 @@ function createPanel(
     })
   );
 
-  header.position.set(-width * 0.18, height * 0.28, 0.015);
+  header.position.set(
+    -width * 0.18,
+    height * 0.28,
+    0.015
+  );
+
   group.add(header);
 
-  // Small system indicators.
+  // System indicators.
   for (let i = 0; i < 5; i += 1) {
     const indicator = new THREE.Mesh(
       new THREE.PlaneGeometry(0.12, 0.12),
@@ -240,11 +272,20 @@ function createPanel(
   }
 
   // Data bars.
-  const barWidths = [0.42, 0.72, 0.54, 0.88, 0.62];
+  const barWidths = [
+    0.42,
+    0.72,
+    0.54,
+    0.88,
+    0.62,
+  ];
 
   barWidths.forEach((barWidth, index) => {
     const bar = new THREE.Mesh(
-      new THREE.PlaneGeometry(barWidth, 0.045),
+      new THREE.PlaneGeometry(
+        barWidth,
+        0.045
+      ),
       new THREE.MeshBasicMaterial({
         color,
         transparent: true,
@@ -266,16 +307,27 @@ function createPanel(
   const graphPoints: THREE.Vector3[] = [];
 
   for (let i = 0; i < 7; i += 1) {
-    const x = -width * 0.38 + i * (width * 0.11);
+    const x =
+      -width * 0.38 +
+      i * (width * 0.11);
+
     const y =
       -height * 0.28 +
       Math.sin(i * 1.35) * 0.08 +
       (i % 3) * 0.035;
 
-    graphPoints.push(new THREE.Vector3(x, y, 0.03));
+    graphPoints.push(
+      new THREE.Vector3(x, y, 0.03)
+    );
   }
 
-  group.add(makeLine(graphPoints, color, 0.55));
+  group.add(
+    makeLine(
+      graphPoints,
+      color,
+      0.55
+    )
+  );
 
   return group;
 }
@@ -287,11 +339,16 @@ function createRadar(color: number): THREE.Group {
 
   radii.forEach((radius, index) => {
     const ring = new THREE.Mesh(
-      new THREE.RingGeometry(radius - 0.008, radius, 96),
+      new THREE.RingGeometry(
+        radius - 0.008,
+        radius,
+        96
+      ),
       new THREE.MeshBasicMaterial({
         color,
         transparent: true,
-        opacity: 0.12 - index * 0.025,
+        opacity:
+          0.12 - index * 0.025,
         side: THREE.DoubleSide,
         depthWrite: false,
         blending: THREE.AdditiveBlending,
@@ -299,6 +356,7 @@ function createRadar(color: number): THREE.Group {
     );
 
     ring.rotation.x = Math.PI / 2;
+
     group.add(ring);
   });
 
@@ -306,18 +364,40 @@ function createRadar(color: number): THREE.Group {
   const positions: number[] = [];
 
   for (let i = 0; i < divisions; i += 1) {
-    const angle = (i / divisions) * Math.PI * 2;
+    const angle =
+      (i / divisions) *
+      Math.PI *
+      2;
 
-    const x1 = Math.cos(angle) * 1.8;
-    const z1 = Math.sin(angle) * 1.8;
+    const x1 =
+      Math.cos(angle) * 1.8;
 
-    const x2 = Math.cos(angle) * 3.1;
-    const z2 = Math.sin(angle) * 3.1;
+    const z1 =
+      Math.sin(angle) * 1.8;
 
-    positions.push(x1, 0, z1, x2, 0, z2);
+    const x2 =
+      Math.cos(angle) * 3.1;
+
+    const z2 =
+      Math.sin(angle) * 3.1;
+
+    positions.push(
+      x1,
+      0,
+      z1,
+      x2,
+      0,
+      z2
+    );
   }
 
-  group.add(makeLineSegments(positions, color, 0.12));
+  group.add(
+    makeLineSegments(
+      positions,
+      color,
+      0.12
+    )
+  );
 
   return group;
 }
@@ -325,9 +405,13 @@ function createRadar(color: number): THREE.Group {
 function createCentralCore(): THREE.Group {
   const group = new THREE.Group();
 
-  // Outer energy halo.
+  // Outer atmospheric halo.
   const halo = new THREE.Mesh(
-    new SphereGeometrySafe(1.65),
+    new THREE.SphereGeometry(
+      1.65,
+      24,
+      24
+    ),
     new THREE.MeshBasicMaterial({
       color: COLORS.blue,
       transparent: true,
@@ -339,9 +423,12 @@ function createCentralCore(): THREE.Group {
 
   group.add(halo);
 
-  // Outer rotating cage.
+  // Outer wireframe cage.
   const outerCage = new THREE.Mesh(
-    new THREE.IcosahedronGeometry(1.45, 1),
+    new THREE.IcosahedronGeometry(
+      1.45,
+      1
+    ),
     new THREE.MeshBasicMaterial({
       color: COLORS.cyan,
       wireframe: true,
@@ -354,9 +441,12 @@ function createCentralCore(): THREE.Group {
 
   group.add(outerCage);
 
-  // Secondary cage.
+  // Inner wireframe cage.
   const innerCage = new THREE.Mesh(
-    new THREE.DodecahedronGeometry(1.05, 1),
+    new THREE.DodecahedronGeometry(
+      1.05,
+      1
+    ),
     new THREE.MeshBasicMaterial({
       color: COLORS.violet,
       wireframe: true,
@@ -369,9 +459,12 @@ function createCentralCore(): THREE.Group {
 
   group.add(innerCage);
 
-  // Central reactor.
+  // Reactor body.
   const reactor = new THREE.Mesh(
-    new THREE.IcosahedronGeometry(0.72, 3),
+    new THREE.IcosahedronGeometry(
+      0.72,
+      3
+    ),
     new THREE.MeshBasicMaterial({
       color: COLORS.cyan,
       transparent: true,
@@ -383,9 +476,13 @@ function createCentralCore(): THREE.Group {
 
   group.add(reactor);
 
-  // Bright inner core.
+  // Bright central core.
   const core = new THREE.Mesh(
-    new THREE.SphereGeometry(0.38, 32, 32),
+    new THREE.SphereGeometry(
+      0.38,
+      32,
+      32
+    ),
     new THREE.MeshBasicMaterial({
       color: COLORS.white,
       transparent: true,
@@ -397,46 +494,72 @@ function createCentralCore(): THREE.Group {
 
   group.add(core);
 
-  // Core glow.
-  const glow1 = makeGlowSphere(0.58, COLORS.cyan, 0.08);
-  const glow2 = makeGlowSphere(0.82, COLORS.violet, 0.035);
+  // Glow layers.
+  group.add(
+    makeGlowSphere(
+      0.58,
+      COLORS.cyan,
+      0.08
+    )
+  );
 
-  group.add(glow1);
-  group.add(glow2);
+  group.add(
+    makeGlowSphere(
+      0.82,
+      COLORS.violet,
+      0.035
+    )
+  );
 
   // Energy rings.
   const ringSpecs = [
-    { radius: 1.75, tube: 0.018, color: COLORS.cyan },
-    { radius: 1.45, tube: 0.012, color: COLORS.violet },
-    { radius: 1.12, tube: 0.009, color: COLORS.blue },
+    {
+      radius: 1.75,
+      tube: 0.018,
+      color: COLORS.cyan,
+    },
+    {
+      radius: 1.45,
+      tube: 0.012,
+      color: COLORS.violet,
+    },
+    {
+      radius: 1.12,
+      tube: 0.009,
+      color: COLORS.blue,
+    },
   ];
 
-  ringSpecs.forEach((spec, index) => {
-    const ring = new THREE.Mesh(
-      new THREE.TorusGeometry(spec.radius, spec.tube, 8, 128),
-      new THREE.MeshBasicMaterial({
-        color: spec.color,
-        transparent: true,
-        opacity: 0.6,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-      })
-    );
+  ringSpecs.forEach(
+    (spec, index) => {
+      const ring = new THREE.Mesh(
+        new THREE.TorusGeometry(
+          spec.radius,
+          spec.tube,
+          8,
+          128
+        ),
+        new THREE.MeshBasicMaterial({
+          color: spec.color,
+          transparent: true,
+          opacity: 0.6,
+          depthWrite: false,
+          blending:
+            THREE.AdditiveBlending,
+        })
+      );
 
-    ring.rotation.set(
-      index === 0 ? 0.3 : 1.0,
-      index === 1 ? 0.8 : 0.2,
-      index * 0.6
-    );
+      ring.rotation.set(
+        index === 0 ? 0.3 : 1.0,
+        index === 1 ? 0.8 : 0.2,
+        index * 0.6
+      );
 
-    group.add(ring);
-  });
+      group.add(ring);
+    }
+  );
 
   return group;
-}
-
-function SphereGeometrySafe(radius: number): THREE.SphereGeometry {
-  return new THREE.SphereGeometry(radius, 24, 24);
 }
 
 function createScanArc(
@@ -470,20 +593,50 @@ function createEnvironmentGrid(): THREE.Group {
 
   const size = 28;
   const divisions = 28;
+
   const positions: number[] = [];
 
-  for (let i = 0; i <= divisions; i += 1) {
-    const value = -size / 2 + (i / divisions) * size;
+  for (
+    let i = 0;
+    i <= divisions;
+    i += 1
+  ) {
+    const value =
+      -size / 2 +
+      (i / divisions) * size;
 
-    positions.push(value, -3.3, -size / 2);
-    positions.push(value, -3.3, size / 2);
+    positions.push(
+      value,
+      -3.3,
+      -size / 2
+    );
 
-    positions.push(-size / 2, -3.3, value);
-    positions.push(size / 2, -3.3, value);
+    positions.push(
+      value,
+      -3.3,
+      size / 2
+    );
+
+    positions.push(
+      -size / 2,
+      -3.3,
+      value
+    );
+
+    positions.push(
+      size / 2,
+      -3.3,
+      value
+    );
   }
 
-  const grid = makeLineSegments(positions, COLORS.blue, 0.065);
-  group.add(grid);
+  group.add(
+    makeLineSegments(
+      positions,
+      COLORS.blue,
+      0.065
+    )
+  );
 
   return group;
 }
@@ -499,11 +652,21 @@ function createConnection(
 
   middle.y += 0.65;
 
-  const curve = new THREE.QuadraticBezierCurve3(start, middle, end);
+  const curve =
+    new THREE.QuadraticBezierCurve3(
+      start,
+      middle,
+      end
+    );
 
-  const points = curve.getPoints(32);
+  const points =
+    curve.getPoints(32);
 
-  return makeLine(points, color, 0.28);
+  return makeLine(
+    points,
+    color,
+    0.28
+  );
 }
 
 function createDataPacket(
@@ -512,32 +675,49 @@ function createDataPacket(
   color: number,
   index: number
 ): DataPacket {
-  const geometry = new THREE.BufferGeometry().setFromPoints([
-    new THREE.Vector3(),
-    new THREE.Vector3(0.055, 0, 0),
-  ]);
+  const geometry =
+    new THREE.BufferGeometry().setFromPoints(
+      [
+        new THREE.Vector3(),
+        new THREE.Vector3(
+          0.055,
+          0,
+          0
+        ),
+      ]
+    );
 
-  const material = new THREE.LineBasicMaterial({
-    color,
-    transparent: true,
-    opacity: 0.95,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
-  });
+  const material =
+    new THREE.LineBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
 
-  const line = new THREE.Line(geometry, material);
+  const line = new THREE.Line(
+    geometry,
+    material
+  );
 
   return {
     line,
     start,
     end,
-    progress: (index * 0.23) % 1,
-    speed: 0.0008 + (index % 3) * 0.00025,
+    progress:
+      (index * 0.23) % 1,
+    speed:
+      0.0008 +
+      (index % 3) * 0.00025,
+    point: new THREE.Vector3(),
+    tail: new THREE.Vector3(),
   };
 }
 
 export default function Scene3DBackground() {
-  const mountRef = useRef<HTMLDivElement | null>(null);
+  const mountRef =
+    useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -550,58 +730,121 @@ export default function Scene3DBackground() {
       return;
     }
 
-    let renderer: THREE.WebGLRenderer | null = null;
-    let scene: THREE.Scene | null = null;
-    let camera: THREE.PerspectiveCamera | null = null;
+    let renderer:
+      | THREE.WebGLRenderer
+      | null = null;
+
+    let scene:
+      | THREE.Scene
+      | null = null;
+
+    let camera:
+      | THREE.PerspectiveCamera
+      | null = null;
 
     let animationFrame = 0;
     let destroyed = false;
     let contextLost = false;
 
-    const cleanupCallbacks: Array<() => void> = [];
+    const cleanupCallbacks:
+      Array<() => void> = [];
 
     try {
+      /*
+       * ============================================================
+       * SCENE
+       * ============================================================
+       */
+
       scene = new THREE.Scene();
 
-      scene.fog = new THREE.FogExp2(0x05060b, 0.028);
-
-      camera = new THREE.PerspectiveCamera(48, 1, 0.1, 100);
-      camera.position.set(0, 1.2, 12);
-
-      renderer = new THREE.WebGLRenderer({
-        antialias: true,
-        alpha: true,
-        powerPreference: "high-performance",
-        depth: false,
-        stencil: false,
-        preserveDrawingBuffer: false,
-      });
-
-      renderer.setPixelRatio(
-        Math.min(window.devicePixelRatio || 1, 1.65)
+      scene.fog = new THREE.FogExp2(
+        0x05060b,
+        0.028
       );
 
-      renderer.setClearColor(0x000000, 0);
+      camera =
+        new THREE.PerspectiveCamera(
+          48,
+          1,
+          0.1,
+          100
+        );
 
-      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      camera.position.set(
+        0,
+        1.2,
+        12
+      );
 
-      mount.appendChild(renderer.domElement);
+      /*
+       * ============================================================
+       * RENDERER
+       * ============================================================
+       */
 
-      renderer.domElement.style.width = "100%";
-      renderer.domElement.style.height = "100%";
-      renderer.domElement.style.display = "block";
-      renderer.domElement.style.pointerEvents = "none";
+      renderer =
+        new THREE.WebGLRenderer({
+          antialias: true,
+          alpha: true,
+          powerPreference:
+            "high-performance",
+          depth: false,
+          stencil: false,
+          preserveDrawingBuffer: false,
+        });
 
-      const canvas = renderer.domElement;
+      renderer.setPixelRatio(
+        Math.min(
+          window.devicePixelRatio || 1,
+          1.65
+        )
+      );
 
-      const handleContextLost = (event: Event) => {
+      renderer.setClearColor(
+        0x000000,
+        0
+      );
+
+      renderer.outputColorSpace =
+        THREE.SRGBColorSpace;
+
+      renderer.domElement.style.width =
+        "100%";
+
+      renderer.domElement.style.height =
+        "100%";
+
+      renderer.domElement.style.display =
+        "block";
+
+      renderer.domElement.style.pointerEvents =
+        "none";
+
+      mount.appendChild(
+        renderer.domElement
+      );
+
+      /*
+       * ============================================================
+       * WEBGL CONTEXT SAFETY
+       * ============================================================
+       */
+
+      const canvas =
+        renderer.domElement;
+
+      const handleContextLost = (
+        event: Event
+      ) => {
         event.preventDefault();
         contextLost = true;
       };
 
-      const handleContextRestored = () => {
-        contextLost = false;
-      };
+      const handleContextRestored =
+        () => {
+          contextLost = false;
+        };
 
       canvas.addEventListener(
         "webglcontextlost",
@@ -628,243 +871,413 @@ export default function Scene3DBackground() {
       });
 
       /*
-       * ------------------------------------------------------------
+       * ============================================================
        * LIGHTING
-       * ------------------------------------------------------------
+       * ============================================================
        */
 
-      const ambientLight = new THREE.AmbientLight(0x3854a8, 0.7);
+      const ambientLight =
+        new THREE.AmbientLight(
+          0x3854a8,
+          0.7
+        );
+
       scene.add(ambientLight);
 
-      const cyanLight = new THREE.PointLight(
-        COLORS.cyan,
-        8,
-        18,
-        2
+      const cyanLight =
+        new THREE.PointLight(
+          COLORS.cyan,
+          8,
+          18,
+          2
+        );
+
+      cyanLight.position.set(
+        0,
+        1,
+        1
       );
 
-      cyanLight.position.set(0, 1, 1);
       scene.add(cyanLight);
 
-      const violetLight = new THREE.PointLight(
-        COLORS.violet,
-        7,
-        16,
-        2
+      const violetLight =
+        new THREE.PointLight(
+          COLORS.violet,
+          7,
+          16,
+          2
+        );
+
+      violetLight.position.set(
+        -4,
+        1.5,
+        -2
       );
 
-      violetLight.position.set(-4, 1.5, -2);
       scene.add(violetLight);
 
-      const blueLight = new THREE.PointLight(
-        COLORS.blue,
-        6,
-        18,
-        2
+      const blueLight =
+        new THREE.PointLight(
+          COLORS.blue,
+          6,
+          18,
+          2
+        );
+
+      blueLight.position.set(
+        4,
+        0.5,
+        -3
       );
 
-      blueLight.position.set(4, 0.5, -3);
       scene.add(blueLight);
 
       /*
-       * ------------------------------------------------------------
-       * ROOT GROUPS
-       * ------------------------------------------------------------
+       * ============================================================
+       * WORLD
+       * ============================================================
        */
 
-      const world = new THREE.Group();
+      const world =
+        new THREE.Group();
+
       scene.add(world);
 
-      const coreSystem = new THREE.Group();
+      /*
+       * ============================================================
+       * CENTRAL AI CORE
+       * ============================================================
+       */
+
+      const coreSystem =
+        new THREE.Group();
+
       coreSystem.position.y = 0.55;
+
       world.add(coreSystem);
 
-      const core = createCentralCore();
+      const core =
+        createCentralCore();
+
       coreSystem.add(core);
 
       /*
-       * ------------------------------------------------------------
-       * RADAR / HUD RINGS
-       * ------------------------------------------------------------
+       * ============================================================
+       * RADAR
+       * ============================================================
        */
 
-      const radar = createRadar(COLORS.cyan);
-      radar.position.y = -0.15;
-      world.add(radar);
-
-      const largeRing = new THREE.Mesh(
-        new THREE.TorusGeometry(3.85, 0.012, 8, 160),
-        new THREE.MeshBasicMaterial({
-          color: COLORS.blue,
-          transparent: true,
-          opacity: 0.24,
-          depthWrite: false,
-          blending: THREE.AdditiveBlending,
-        })
-      );
-
-      largeRing.rotation.x = Math.PI / 2;
-      largeRing.position.y = -0.1;
-      world.add(largeRing);
-
-      /*
-       * ------------------------------------------------------------
-       * SCANNING ARCS
-       * ------------------------------------------------------------
-       */
-
-      const scanArcs = [
-        createScanArc(2.0, COLORS.cyan, 0.2, 1.3),
-        createScanArc(2.7, COLORS.violet, 2.2, 0.9),
-        createScanArc(3.35, COLORS.blue, 4.0, 1.15),
-      ];
-
-      scanArcs.forEach((arc, index) => {
-        arc.rotation.x = Math.PI / 2;
-        arc.position.y = 0.05 + index * 0.025;
-        world.add(arc);
-      });
-
-      /*
-       * ------------------------------------------------------------
-       * VERTICAL HOLOGRAPHIC BEAM
-       * ------------------------------------------------------------
-       */
-
-      const beam = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.28, 0.55, 7, 32, 1, true),
-        new THREE.MeshBasicMaterial({
-          color: COLORS.cyan,
-          transparent: true,
-          opacity: 0.025,
-          side: THREE.DoubleSide,
-          depthWrite: false,
-          blending: THREE.AdditiveBlending,
-        })
-      );
-
-      beam.position.set(0, 0.7, 0);
-      world.add(beam);
-
-      /*
-       * ------------------------------------------------------------
-       * AGENT NETWORK
-       * ------------------------------------------------------------
-       */
-
-      const agentGroup = new THREE.Group();
-      world.add(agentGroup);
-
-      const agents: AgentNode[] = [];
-
-      const desktopRadius = 5.1;
-
-      AGENTS.forEach((agent, index) => {
-        const angle =
-          -Math.PI / 2 + (index / AGENTS.length) * Math.PI * 2;
-
-        const position = new THREE.Vector3(
-          Math.cos(angle) * desktopRadius,
-          0.35 + Math.sin(index * 1.4) * 0.3,
-          Math.sin(angle) * desktopRadius
+      const radar =
+        createRadar(
+          COLORS.cyan
         );
 
-        const mesh = new THREE.Mesh(
-          new THREE.OctahedronGeometry(0.23, 1),
+      radar.position.y = -0.15;
+
+      world.add(radar);
+
+      const largeRing =
+        new THREE.Mesh(
+          new THREE.TorusGeometry(
+            3.85,
+            0.012,
+            8,
+            160
+          ),
           new THREE.MeshBasicMaterial({
-            color: agent.color,
-            wireframe: true,
+            color: COLORS.blue,
             transparent: true,
-            opacity: 0.85,
+            opacity: 0.24,
             depthWrite: false,
-            blending: THREE.AdditiveBlending,
+            blending:
+              THREE.AdditiveBlending,
           })
         );
 
-        mesh.position.copy(position);
+      largeRing.rotation.x =
+        Math.PI / 2;
 
-        const glow = makeGlowSphere(0.6, agent.color, 0.05);
-        glow.position.copy(position);
+      largeRing.position.y = -0.1;
 
-        agentGroup.add(mesh);
-        agentGroup.add(glow);
-
-        agents.push({
-          name: agent.name,
-          angle,
-          radius: desktopRadius,
-          color: agent.color,
-          position,
-          mesh,
-          glow,
-          pulse: index * 1.4,
-        });
-      });
+      world.add(largeRing);
 
       /*
-       * ------------------------------------------------------------
-       * NETWORK CONNECTIONS
-       * ------------------------------------------------------------
+       * ============================================================
+       * SCANNING ARCS
+       * ============================================================
        */
 
-      const connections = new THREE.Group();
-      world.add(connections);
+      const scanArcs = [
+        createScanArc(
+          2.0,
+          COLORS.cyan,
+          0.2,
+          1.3
+        ),
+        createScanArc(
+          2.7,
+          COLORS.violet,
+          2.2,
+          0.9
+        ),
+        createScanArc(
+          3.35,
+          COLORS.blue,
+          4.0,
+          1.15
+        ),
+      ];
 
-      const dataPackets: DataPacket[] = [];
+      scanArcs.forEach(
+        (arc, index) => {
+          arc.rotation.x =
+            Math.PI / 2;
 
-      agents.forEach((agent, index) => {
-        const start = new THREE.Vector3(0, 0.55, 0);
+          arc.position.y =
+            0.05 +
+            index * 0.025;
 
-        const end = agent.position.clone();
+          world.add(arc);
+        }
+      );
 
-        const connection = createConnection(
-          start,
-          end,
-          agent.color
+      /*
+       * ============================================================
+       * HOLOGRAPHIC ENERGY BEAM
+       * ============================================================
+       */
+
+      const beam =
+        new THREE.Mesh(
+          new THREE.CylinderGeometry(
+            0.28,
+            0.55,
+            7,
+            32,
+            1,
+            true
+          ),
+          new THREE.MeshBasicMaterial({
+            color: COLORS.cyan,
+            transparent: true,
+            opacity: 0.025,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+            blending:
+              THREE.AdditiveBlending,
+          })
         );
 
-        connections.add(connection);
+      beam.position.set(
+        0,
+        0.7,
+        0
+      );
 
-        for (let packetIndex = 0; packetIndex < 2; packetIndex += 1) {
-          const packet = createDataPacket(
-            start,
-            end,
-            agent.color,
-            index * 2 + packetIndex
+      world.add(beam);
+
+      /*
+       * ============================================================
+       * FOUR AI AGENTS
+       * ============================================================
+       */
+
+      const agentGroup =
+        new THREE.Group();
+
+      world.add(agentGroup);
+
+      const agents: AgentNode[] =
+        [];
+
+      const desktopRadius = 5.1;
+
+      AGENTS.forEach(
+        (agent, index) => {
+          const angle =
+            -Math.PI / 2 +
+            (index /
+              AGENTS.length) *
+              Math.PI *
+              2;
+
+          const position =
+            new THREE.Vector3(
+              Math.cos(angle) *
+                desktopRadius,
+              0.35 +
+                Math.sin(
+                  index * 1.4
+                ) *
+                  0.3,
+              Math.sin(angle) *
+                desktopRadius
+            );
+
+          const mesh =
+            new THREE.Mesh(
+              new THREE.OctahedronGeometry(
+                0.23,
+                1
+              ),
+              new THREE.MeshBasicMaterial({
+                color:
+                  agent.color,
+                wireframe: true,
+                transparent: true,
+                opacity: 0.85,
+                depthWrite: false,
+                blending:
+                  THREE.AdditiveBlending,
+              })
+            );
+
+          mesh.position.copy(
+            position
           );
 
-          connections.add(packet.line);
-          dataPackets.push(packet);
+          const glow =
+            makeGlowSphere(
+              0.6,
+              agent.color,
+              0.05
+            );
+
+          glow.position.copy(
+            position
+          );
+
+          agentGroup.add(mesh);
+          agentGroup.add(glow);
+
+          agents.push({
+            name: agent.name,
+            angle,
+            radius:
+              desktopRadius,
+            color:
+              agent.color,
+            position,
+            mesh,
+            glow,
+            pulse:
+              index * 1.4,
+          });
         }
-      });
+      );
 
-      // Secondary network between agents.
-      for (let i = 0; i < agents.length; i += 1) {
-        const current = agents[i];
-        const next = agents[(i + 1) % agents.length];
+      /*
+       * ============================================================
+       * NEURAL NETWORK
+       * ============================================================
+       */
 
-        const secondary = createConnection(
-          current.position,
-          next.position,
-          COLORS.blue
+      const connections =
+        new THREE.Group();
+
+      world.add(connections);
+
+      const dataPackets:
+        DataPacket[] = [];
+
+      agents.forEach(
+        (agent, index) => {
+          const start =
+            new THREE.Vector3(
+              0,
+              0.55,
+              0
+            );
+
+          const end =
+            agent.position.clone();
+
+          const connection =
+            createConnection(
+              start,
+              end,
+              agent.color
+            );
+
+          connections.add(
+            connection
+          );
+
+          for (
+            let packetIndex = 0;
+            packetIndex < 2;
+            packetIndex += 1
+          ) {
+            const packet =
+              createDataPacket(
+                start,
+                end,
+                agent.color,
+                index * 2 +
+                  packetIndex
+              );
+
+            connections.add(
+              packet.line
+            );
+
+            dataPackets.push(
+              packet
+            );
+          }
+        }
+      );
+
+      /*
+       * Agent-to-agent secondary network.
+       */
+      for (
+        let i = 0;
+        i < agents.length;
+        i += 1
+      ) {
+        const current =
+          agents[i];
+
+        const next =
+          agents[
+            (i + 1) %
+              agents.length
+          ];
+
+        const secondary =
+          createConnection(
+            current.position,
+            next.position,
+            COLORS.blue
+          );
+
+        const material =
+          secondary.material as THREE.LineBasicMaterial;
+
+        material.opacity =
+          0.12;
+
+        connections.add(
+          secondary
         );
-
-        const material = secondary.material as THREE.LineBasicMaterial;
-        material.opacity = 0.12;
-
-        connections.add(secondary);
       }
 
       /*
-       * ------------------------------------------------------------
+       * ============================================================
        * HOLOGRAPHIC DATA PANELS
-       * ------------------------------------------------------------
+       * ============================================================
        */
 
-      const panelsGroup = new THREE.Group();
-      world.add(panelsGroup);
+      const panelsGroup =
+        new THREE.Group();
 
-      const panels: Panel[] = [];
+      world.add(
+        panelsGroup
+      );
+
+      const panels: Panel[] =
+        [];
 
       const panelDefinitions = [
         {
@@ -893,205 +1306,365 @@ export default function Scene3DBackground() {
         },
       ];
 
-      panelDefinitions.forEach((definition, index) => {
-        const panel = createPanel(definition.color);
+      panelDefinitions.forEach(
+        (
+          definition,
+          index
+        ) => {
+          const panel =
+            createPanel(
+              definition.color
+            );
 
-        panel.scale.setScalar(definition.scale);
+          panel.scale.setScalar(
+            definition.scale
+          );
 
-        panel.position.set(
-          Math.cos(definition.angle) * definition.radius,
-          1.3 + Math.sin(index * 2.1) * 0.5,
-          Math.sin(definition.angle) * definition.radius
-        );
+          panel.position.set(
+            Math.cos(
+              definition.angle
+            ) *
+              definition.radius,
+            1.3 +
+              Math.sin(
+                index * 2.1
+              ) *
+                0.5,
+            Math.sin(
+              definition.angle
+            ) *
+              definition.radius
+          );
 
-        panel.lookAt(0, 1.1, 0);
+          panel.lookAt(
+            0,
+            1.1,
+            0
+          );
 
-        panelsGroup.add(panel);
+          panelsGroup.add(
+            panel
+          );
 
-        panels.push({
-          group: panel,
-          angle: definition.angle,
-          radius: definition.radius,
-          phase: index * 1.8,
-        });
-      });
-
-      /*
-       * ------------------------------------------------------------
-       * AMBIENT PARTICLES
-       * ------------------------------------------------------------
-       */
-
-      const particleCount = window.innerWidth < 768 ? 280 : 650;
-
-      const particlePositions = new Float32Array(
-        particleCount * 3
+          panels.push({
+            group: panel,
+            phase:
+              index * 1.8,
+            baseY:
+              panel.position.y,
+            baseScale:
+              definition.scale,
+          });
+        }
       );
 
-      const particleSizes = new Float32Array(particleCount);
+      /*
+       * ============================================================
+       * AMBIENT PARTICLES
+       * ============================================================
+       */
 
-      for (let i = 0; i < particleCount; i += 1) {
-        const radius = 5 + Math.random() * 11;
-        const angle = Math.random() * Math.PI * 2;
+      const initialWidth =
+        window.innerWidth;
 
-        particlePositions[i * 3] =
-          Math.cos(angle) * radius;
+      const particleCount =
+        initialWidth < 768
+          ? 280
+          : 650;
 
-        particlePositions[i * 3 + 1] =
-          -2.5 + Math.random() * 8;
+      const particlePositions =
+        new Float32Array(
+          particleCount * 3
+        );
 
-        particlePositions[i * 3 + 2] =
-          Math.sin(angle) * radius - 2;
+      for (
+        let i = 0;
+        i < particleCount;
+        i += 1
+      ) {
+        const radius =
+          5 +
+          Math.random() * 11;
 
-        particleSizes[i] =
-          0.015 + Math.random() * 0.035;
+        const angle =
+          Math.random() *
+          Math.PI *
+          2;
+
+        particlePositions[
+          i * 3
+        ] =
+          Math.cos(angle) *
+          radius;
+
+        particlePositions[
+          i * 3 + 1
+        ] =
+          -2.5 +
+          Math.random() * 8;
+
+        particlePositions[
+          i * 3 + 2
+        ] =
+          Math.sin(angle) *
+            radius -
+          2;
       }
 
-      const particleGeometry = new THREE.BufferGeometry();
+      const particleGeometry =
+        new THREE.BufferGeometry();
 
       particleGeometry.setAttribute(
         "position",
-        new THREE.BufferAttribute(particlePositions, 3)
+        new THREE.BufferAttribute(
+          particlePositions,
+          3
+        )
       );
 
-      particleGeometry.setAttribute(
-        "size",
-        new THREE.BufferAttribute(particleSizes, 1)
-      );
+      const particleMaterial =
+        new THREE.PointsMaterial({
+          color: COLORS.cyan,
+          size: 0.045,
+          transparent: true,
+          opacity: 0.48,
+          depthWrite: false,
+          blending:
+            THREE.AdditiveBlending,
+          sizeAttenuation: true,
+        });
 
-      const particleMaterial = new THREE.PointsMaterial({
-        color: COLORS.cyan,
-        size: 0.045,
-        transparent: true,
-        opacity: 0.48,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-        sizeAttenuation: true,
-      });
-
-      const particles = new THREE.Points(
-        particleGeometry,
-        particleMaterial
-      );
+      const particles =
+        new THREE.Points(
+          particleGeometry,
+          particleMaterial
+        );
 
       world.add(particles);
 
       /*
-       * ------------------------------------------------------------
+       * ============================================================
        * RADIAL HUD RAYS
-       * ------------------------------------------------------------
+       * ============================================================
        */
 
-      const rayPositions: number[] = [];
+      const rayPositions: number[] =
+        [];
 
-      for (let i = 0; i < 64; i += 1) {
-        const angle = (i / 64) * Math.PI * 2;
+      for (
+        let i = 0;
+        i < 64;
+        i += 1
+      ) {
+        const angle =
+          (i / 64) *
+          Math.PI *
+          2;
 
         const inner = 3.9;
         const outer = 7.5;
 
         rayPositions.push(
-          Math.cos(angle) * inner,
+          Math.cos(angle) *
+            inner,
           -0.02,
-          Math.sin(angle) * inner
+          Math.sin(angle) *
+            inner
         );
 
         rayPositions.push(
-          Math.cos(angle) * outer,
+          Math.cos(angle) *
+            outer,
           -0.02,
-          Math.sin(angle) * outer
+          Math.sin(angle) *
+            outer
         );
       }
 
-      const rays = makeLineSegments(
-        rayPositions,
-        COLORS.blue,
-        0.08
-      );
+      const rays =
+        makeLineSegments(
+          rayPositions,
+          COLORS.blue,
+          0.08
+        );
 
       world.add(rays);
 
       /*
-       * ------------------------------------------------------------
-       * FLOOR LIGHT RINGS
-       * ------------------------------------------------------------
+       * ============================================================
+       * FLOOR RING
+       * ============================================================
        */
 
-      const floorRing = new THREE.Mesh(
-        new THREE.RingGeometry(4.6, 4.62, 128),
-        new THREE.MeshBasicMaterial({
-          color: COLORS.cyan,
-          transparent: true,
-          opacity: 0.22,
-          side: THREE.DoubleSide,
-          depthWrite: false,
-          blending: THREE.AdditiveBlending,
-        })
+      const floorRing =
+        new THREE.Mesh(
+          new THREE.RingGeometry(
+            4.6,
+            4.62,
+            128
+          ),
+          new THREE.MeshBasicMaterial({
+            color: COLORS.cyan,
+            transparent: true,
+            opacity: 0.22,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+            blending:
+              THREE.AdditiveBlending,
+          })
+        );
+
+      floorRing.rotation.x =
+        Math.PI / 2;
+
+      floorRing.position.y =
+        -3.27;
+
+      world.add(
+        floorRing
       );
 
-      floorRing.rotation.x = Math.PI / 2;
-      floorRing.position.y = -3.27;
-
-      world.add(floorRing);
-
       /*
-       * ------------------------------------------------------------
+       * ============================================================
        * ENVIRONMENT GRID
-       * ------------------------------------------------------------
+       * ============================================================
        */
 
-      const environmentGrid = createEnvironmentGrid();
+      const environmentGrid =
+        createEnvironmentGrid();
 
-      environmentGrid.position.z = -2;
-      world.add(environmentGrid);
+      environmentGrid.position.z =
+        -2;
+
+      world.add(
+        environmentGrid
+      );
 
       /*
-       * ------------------------------------------------------------
-       * RESPONSIVE CAMERA
-       * ------------------------------------------------------------
+       * ============================================================
+       * RESPONSIVE LAYOUT
+       * ============================================================
        */
 
       const updateSize = () => {
-        if (!renderer || !camera || !mount) {
+        if (
+          !renderer ||
+          !camera ||
+          !mount
+        ) {
           return;
         }
 
-        const width = Math.max(1, mount.clientWidth);
-        const height = Math.max(1, mount.clientHeight);
+        const width =
+          Math.max(
+            1,
+            mount.clientWidth
+          );
 
-        camera.aspect = width / height;
+        const height =
+          Math.max(
+            1,
+            mount.clientHeight
+          );
+
+        camera.aspect =
+          width / height;
 
         if (width < 480) {
           camera.fov = 55;
-          camera.position.set(0, 1.7, 15.5);
-          world.scale.setScalar(0.78);
-          coreSystem.position.y = 1.2;
-          panelsGroup.visible = false;
-          environmentGrid.visible = false;
+
+          camera.position.set(
+            0,
+            1.7,
+            15.5
+          );
+
+          world.scale.setScalar(
+            0.78
+          );
+
+          coreSystem.position.y =
+            1.2;
+
+          panelsGroup.visible =
+            false;
+
+          environmentGrid.visible =
+            false;
+
           rays.visible = false;
-        } else if (width < 768) {
+        } else if (
+          width < 768
+        ) {
           camera.fov = 52;
-          camera.position.set(0, 1.5, 14);
-          world.scale.setScalar(0.88);
-          coreSystem.position.y = 0.95;
-          panelsGroup.visible = false;
-          environmentGrid.visible = true;
+
+          camera.position.set(
+            0,
+            1.5,
+            14
+          );
+
+          world.scale.setScalar(
+            0.88
+          );
+
+          coreSystem.position.y =
+            0.95;
+
+          panelsGroup.visible =
+            false;
+
+          environmentGrid.visible =
+            true;
+
           rays.visible = true;
-        } else if (width < 1100) {
+        } else if (
+          width < 1100
+        ) {
           camera.fov = 49;
-          camera.position.set(0, 1.3, 13);
-          world.scale.setScalar(0.94);
-          coreSystem.position.y = 0.75;
-          panelsGroup.visible = true;
-          environmentGrid.visible = true;
+
+          camera.position.set(
+            0,
+            1.3,
+            13
+          );
+
+          world.scale.setScalar(
+            0.94
+          );
+
+          coreSystem.position.y =
+            0.75;
+
+          panelsGroup.visible =
+            true;
+
+          environmentGrid.visible =
+            true;
+
           rays.visible = true;
         } else {
           camera.fov = 47;
-          camera.position.set(0, 1.1, 12);
-          world.scale.setScalar(1);
-          coreSystem.position.y = 0.55;
-          panelsGroup.visible = true;
-          environmentGrid.visible = true;
+
+          camera.position.set(
+            0,
+            1.1,
+            12
+          );
+
+          world.scale.setScalar(
+            1
+          );
+
+          coreSystem.position.y =
+            0.55;
+
+          panelsGroup.visible =
+            true;
+
+          environmentGrid.visible =
+            true;
+
           rays.visible = true;
         }
 
@@ -1099,356 +1672,489 @@ export default function Scene3DBackground() {
 
         renderer.setPixelRatio(
           Math.min(
-            window.devicePixelRatio || 1,
-            width < 768 ? 1.25 : 1.65
+            window.devicePixelRatio ||
+              1,
+            width < 768
+              ? 1.25
+              : 1.65
           )
         );
 
-        renderer.setSize(width, height, false);
+        renderer.setSize(
+          width,
+          height,
+          false
+        );
       };
 
       updateSize();
 
-      const resizeObserver = new ResizeObserver(updateSize);
-      resizeObserver.observe(mount);
+      const resizeObserver =
+        new ResizeObserver(
+          updateSize
+        );
 
-      cleanupCallbacks.push(() => {
-        resizeObserver.disconnect();
-      });
+      resizeObserver.observe(
+        mount
+      );
+
+      cleanupCallbacks.push(
+        () => {
+          resizeObserver.disconnect();
+        }
+      );
 
       /*
-       * ------------------------------------------------------------
-       * MOUSE / POINTER PARALLAX
-       * ------------------------------------------------------------
+       * ============================================================
+       * MOUSE PARALLAX
+       * ============================================================
        */
 
       let targetRotationX = 0;
       let targetRotationY = 0;
+
       let currentRotationX = 0;
       let currentRotationY = 0;
 
-      const handlePointerMove = (event: PointerEvent) => {
-        if (window.innerWidth < 768) {
+      const handlePointerMove = (
+        event: PointerEvent
+      ) => {
+        if (
+          window.innerWidth <
+          768
+        ) {
           return;
         }
 
         const normalizedX =
-          event.clientX / window.innerWidth - 0.5;
+          event.clientX /
+            window.innerWidth -
+          0.5;
 
         const normalizedY =
-          event.clientY / window.innerHeight - 0.5;
+          event.clientY /
+            window.innerHeight -
+          0.5;
 
-        targetRotationY = normalizedX * 0.12;
-        targetRotationX = normalizedY * 0.07;
+        targetRotationY =
+          normalizedX * 0.12;
+
+        targetRotationX =
+          normalizedY * 0.07;
       };
 
-      window.addEventListener("pointermove", handlePointerMove, {
-        passive: true,
-      });
+      window.addEventListener(
+        "pointermove",
+        handlePointerMove,
+        {
+          passive: true,
+        }
+      );
 
-      cleanupCallbacks.push(() => {
-        window.removeEventListener(
-          "pointermove",
-          handlePointerMove
-        );
-      });
+      cleanupCallbacks.push(
+        () => {
+          window.removeEventListener(
+            "pointermove",
+            handlePointerMove
+          );
+        }
+      );
 
       /*
-       * ------------------------------------------------------------
+       * ============================================================
        * ANIMATION
-       * ------------------------------------------------------------
+       * ============================================================
        */
 
-      const clock = new THREE.Clock();
+      const clock =
+        new THREE.Clock();
 
-      const prefersReducedMotion = window.matchMedia(
-        "(prefers-reduced-motion: reduce)"
-      ).matches;
+      const prefersReducedMotion =
+        window.matchMedia(
+          "(prefers-reduced-motion: reduce)"
+        ).matches;
 
       const animate = () => {
         if (destroyed) {
           return;
         }
 
-        animationFrame = window.requestAnimationFrame(animate);
+        animationFrame =
+          window.requestAnimationFrame(
+            animate
+          );
 
-        if (contextLost || !renderer || !scene || !camera) {
+        if (
+          contextLost ||
+          !renderer ||
+          !scene ||
+          !camera
+        ) {
           return;
         }
 
-        const elapsed = clock.getElapsedTime();
+        const elapsed =
+          clock.getElapsedTime();
 
-        if (!prefersReducedMotion) {
+        if (
+          !prefersReducedMotion
+        ) {
           /*
-           * Camera parallax.
+           * Camera movement.
            */
           currentRotationX +=
-            (targetRotationX - currentRotationX) * 0.025;
+            (targetRotationX -
+              currentRotationX) *
+            0.025;
 
           currentRotationY +=
-            (targetRotationY - currentRotationY) * 0.025;
+            (targetRotationY -
+              currentRotationY) *
+            0.025;
 
-          world.rotation.x = currentRotationX;
-          world.rotation.y = currentRotationY;
+          world.rotation.x =
+            currentRotationX;
+
+          world.rotation.y =
+            currentRotationY;
 
           /*
-           * Central AI reactor.
+           * Central reactor.
            */
-          core.rotation.y += 0.0025;
-          core.rotation.x += 0.0012;
+          core.rotation.y +=
+            0.0025;
 
-          const coreChildren = core.children;
+          core.rotation.x +=
+            0.0012;
+
+          const coreChildren =
+            core.children;
 
           if (coreChildren[1]) {
-            coreChildren[1].rotation.y -= 0.004;
-            coreChildren[1].rotation.z += 0.0015;
+            coreChildren[1].rotation.y -=
+              0.004;
+
+            coreChildren[1].rotation.z +=
+              0.0015;
           }
 
           if (coreChildren[2]) {
-            coreChildren[2].rotation.x += 0.003;
-            coreChildren[2].rotation.y += 0.002;
+            coreChildren[2].rotation.x +=
+              0.003;
+
+            coreChildren[2].rotation.y +=
+              0.002;
           }
 
           if (coreChildren[3]) {
             const pulse =
-              1 + Math.sin(elapsed * 3.4) * 0.045;
+              1 +
+              Math.sin(
+                elapsed * 3.4
+              ) *
+                0.045;
 
-            coreChildren[3].scale.setScalar(pulse);
+            coreChildren[3].scale.setScalar(
+              pulse
+            );
           }
 
           if (coreChildren[4]) {
             const pulse =
-              1 + Math.sin(elapsed * 4.1) * 0.08;
+              1 +
+              Math.sin(
+                elapsed * 4.1
+              ) *
+                0.08;
 
-            coreChildren[4].scale.setScalar(pulse);
+            coreChildren[4].scale.setScalar(
+              pulse
+            );
           }
 
           /*
-           * Energy rings.
+           * Core energy rings.
            */
           for (
             let index = 6;
-            index < core.children.length;
+            index <
+            core.children.length;
             index += 1
           ) {
-            const ring = core.children[index];
+            const ring =
+              core.children[index];
 
             ring.rotation.x +=
-              index % 2 === 0 ? 0.0018 : -0.0013;
+              index % 2 === 0
+                ? 0.0018
+                : -0.0013;
 
             ring.rotation.y +=
-              index % 2 === 0 ? -0.0012 : 0.0018;
+              index % 2 === 0
+                ? -0.0012
+                : 0.0018;
           }
 
           /*
            * Radar.
            */
-          radar.rotation.y += 0.0009;
+          radar.rotation.y +=
+            0.0009;
 
           /*
            * Outer ring.
            */
-          largeRing.rotation.z += 0.0007;
+          largeRing.rotation.z +=
+            0.0007;
 
           /*
            * Scan arcs.
            */
-          scanArcs.forEach((arc, index) => {
-            arc.rotation.z +=
-              index % 2 === 0 ? 0.003 : -0.002;
+          scanArcs.forEach(
+            (arc, index) => {
+              arc.rotation.z +=
+                index % 2 === 0
+                  ? 0.003
+                  : -0.002;
 
-            const material =
-              arc.material as THREE.MeshBasicMaterial;
+              const material =
+                arc.material as THREE.MeshBasicMaterial;
 
-            material.opacity =
-              0.42 +
-              Math.sin(elapsed * 2 + index) * 0.18;
-          });
+              material.opacity =
+                0.42 +
+                Math.sin(
+                  elapsed * 2 +
+                    index
+                ) *
+                  0.18;
+            }
+          );
 
           /*
-           * Vertical beam.
+           * Beam pulse.
            */
           const beamMaterial =
             beam.material as THREE.MeshBasicMaterial;
 
           beamMaterial.opacity =
-            0.02 + Math.sin(elapsed * 2.4) * 0.008;
+            0.02 +
+            Math.sin(
+              elapsed * 2.4
+            ) *
+              0.008;
 
           /*
-           * Agent nodes.
+           * Four AI agents.
            */
-          agents.forEach((agent, index) => {
-            const pulse =
-              1 +
-              Math.sin(
-                elapsed * 2.2 + agent.pulse
-              ) *
-                0.2;
+          agents.forEach(
+            (agent, index) => {
+              const pulse =
+                1 +
+                Math.sin(
+                  elapsed * 2.2 +
+                    agent.pulse
+                ) *
+                  0.2;
 
-            agent.mesh.scale.setScalar(pulse);
+              agent.mesh.scale.setScalar(
+                pulse
+              );
 
-            agent.mesh.rotation.x +=
-              0.006 + index * 0.0005;
+              agent.mesh.rotation.x +=
+                0.006 +
+                index * 0.0005;
 
-            agent.mesh.rotation.y +=
-              0.009 + index * 0.0006;
+              agent.mesh.rotation.y +=
+                0.009 +
+                index * 0.0006;
 
-            const glowScale =
-              0.9 +
-              Math.sin(
-                elapsed * 2.2 + agent.pulse
-              ) *
-                0.16;
+              const glowScale =
+                0.9 +
+                Math.sin(
+                  elapsed * 2.2 +
+                    agent.pulse
+                ) *
+                  0.16;
 
-            agent.glow.scale.setScalar(glowScale);
+              agent.glow.scale.setScalar(
+                glowScale
+              );
 
-            const material =
-              agent.mesh.material as THREE.MeshBasicMaterial;
+              const material =
+                agent.mesh.material as THREE.MeshBasicMaterial;
 
-            material.opacity =
-              0.55 +
-              Math.sin(
-                elapsed * 2.2 + agent.pulse
-              ) *
-                0.25;
-          });
-
-          /*
-           * Data packets traveling through the network.
-           */
-          dataPackets.forEach((packet) => {
-            packet.progress += packet.speed;
-
-            if (packet.progress > 1) {
-              packet.progress = 0;
+              material.opacity =
+                0.55 +
+                Math.sin(
+                  elapsed * 2.2 +
+                    agent.pulse
+                ) *
+                  0.25;
             }
-
-            const point = new THREE.Vector3().lerpVectors(
-              packet.start,
-              packet.end,
-              packet.progress
-            );
-
-            const tail = new THREE.Vector3().lerpVectors(
-              packet.start,
-              packet.end,
-              Math.max(0, packet.progress - 0.025)
-            );
-
-            const positions = packet.line.geometry.getAttribute(
-              "position"
-            ) as THREE.BufferAttribute;
-
-            positions.setXYZ(
-              0,
-              tail.x,
-              tail.y,
-              tail.z
-            );
-
-            positions.setXYZ(
-              1,
-              point.x,
-              point.y,
-              point.z
-            );
-
-            positions.needsUpdate = true;
-          });
+          );
 
           /*
-           * Floating data panels.
+           * Data packets.
            */
-          panels.forEach((panel, index) => {
-            const floatY =
-              Math.sin(
-                elapsed * 0.8 + panel.phase
-              ) * 0.08;
+          dataPackets.forEach(
+            (packet) => {
+              packet.progress +=
+                packet.speed;
 
-            panel.group.position.y +=
-              (floatY -
-                (panel.group.userData.baseFloat ?? 0)) *
-              0.02;
+              if (
+                packet.progress >
+                1
+              ) {
+                packet.progress = 0;
+              }
 
-            panel.group.userData.baseFloat = floatY;
+              packet.point.lerpVectors(
+                packet.start,
+                packet.end,
+                packet.progress
+              );
 
-            panel.group.rotation.z =
-              Math.sin(
-                elapsed * 0.35 + panel.phase
-              ) * 0.015;
+              packet.tail.lerpVectors(
+                packet.start,
+                packet.end,
+                Math.max(
+                  0,
+                  packet.progress -
+                    0.025
+                )
+              );
 
-            const scalePulse =
-              1 +
-              Math.sin(
-                elapsed * 1.3 + index
-              ) *
-                0.008;
+              const positions =
+                packet.line.geometry.getAttribute(
+                  "position"
+                ) as THREE.BufferAttribute;
 
-            panel.group.scale.setScalar(
-              panel.group.userData.baseScale
-                ? panel.group.userData.baseScale *
-                    scalePulse
-                : scalePulse
-            );
-          });
+              positions.setXYZ(
+                0,
+                packet.tail.x,
+                packet.tail.y,
+                packet.tail.z
+              );
+
+              positions.setXYZ(
+                1,
+                packet.point.x,
+                packet.point.y,
+                packet.point.z
+              );
+
+              positions.needsUpdate =
+                true;
+            }
+          );
+
+          /*
+           * Holographic panels.
+           */
+          panels.forEach(
+            (panel, index) => {
+              panel.group.position.y =
+                panel.baseY +
+                Math.sin(
+                  elapsed * 0.8 +
+                    panel.phase
+                ) *
+                  0.08;
+
+              panel.group.rotation.z =
+                Math.sin(
+                  elapsed * 0.35 +
+                    panel.phase
+                ) *
+                  0.015;
+
+              const scalePulse =
+                1 +
+                Math.sin(
+                  elapsed * 1.3 +
+                    index
+                ) *
+                  0.008;
+
+              panel.group.scale.setScalar(
+                panel.baseScale *
+                  scalePulse
+              );
+            }
+          );
 
           /*
            * Particles.
            */
-          particles.rotation.y += 0.00035;
+          particles.rotation.y +=
+            0.00035;
+
           particles.rotation.x =
-            Math.sin(elapsed * 0.12) * 0.015;
+            Math.sin(
+              elapsed * 0.12
+            ) * 0.015;
 
           /*
-           * Grid movement.
+           * Floor grid.
            */
           environmentGrid.position.z =
-            -2 + Math.sin(elapsed * 0.15) * 0.08;
+            -2 +
+            Math.sin(
+              elapsed * 0.15
+            ) *
+              0.08;
 
           /*
-           * Floor ring pulse.
+           * Floor ring.
            */
           const floorPulse =
             1 +
-            Math.sin(elapsed * 1.8) * 0.015;
+            Math.sin(
+              elapsed * 1.8
+            ) *
+              0.015;
 
-          floorRing.scale.setScalar(floorPulse);
+          floorRing.scale.setScalar(
+            floorPulse
+          );
         }
 
-        renderer.render(scene, camera);
+        renderer.render(
+          scene,
+          camera
+        );
       };
-
-      panels.forEach((panel) => {
-        panel.group.userData.baseScale =
-          panel.group.scale.x;
-        panel.group.userData.baseFloat =
-          panel.group.position.y;
-      });
 
       animate();
 
       /*
-       * ------------------------------------------------------------
+       * ============================================================
        * CLEANUP
-       * ------------------------------------------------------------
+       * ============================================================
        */
 
       return () => {
         destroyed = true;
 
-        window.cancelAnimationFrame(animationFrame);
+        window.cancelAnimationFrame(
+          animationFrame
+        );
 
-        cleanupCallbacks.forEach((callback) => {
+        for (
+          const callback of cleanupCallbacks
+        ) {
           try {
             callback();
           } catch {
             // Defensive cleanup.
           }
-        });
+        }
 
         try {
           if (scene) {
-            disposeObject3D(scene);
+            disposeObject3D(
+              scene
+            );
           }
         } catch {
           // Defensive cleanup.
@@ -1459,12 +2165,16 @@ export default function Scene3DBackground() {
             renderer.forceContextLoss();
             renderer.dispose();
 
-            const rendererCanvas = renderer.domElement;
+            const rendererCanvas =
+              renderer.domElement;
 
             if (
-              rendererCanvas.parentElement === mount
+              rendererCanvas.parentElement ===
+              mount
             ) {
-              mount.removeChild(rendererCanvas);
+              mount.removeChild(
+                rendererCanvas
+              );
             }
           }
         } catch {
@@ -1483,19 +2193,25 @@ export default function Scene3DBackground() {
 
       destroyed = true;
 
-      window.cancelAnimationFrame(animationFrame);
+      window.cancelAnimationFrame(
+        animationFrame
+      );
 
-      cleanupCallbacks.forEach((callback) => {
+      for (
+        const callback of cleanupCallbacks
+      ) {
         try {
           callback();
         } catch {
           // Defensive cleanup.
         }
-      });
+      }
 
       try {
         if (scene) {
-          disposeObject3D(scene);
+          disposeObject3D(
+            scene
+          );
         }
       } catch {
         // Defensive cleanup.
@@ -1506,12 +2222,16 @@ export default function Scene3DBackground() {
           renderer.forceContextLoss();
           renderer.dispose();
 
-          const rendererCanvas = renderer.domElement;
+          const rendererCanvas =
+            renderer.domElement;
 
           if (
-            rendererCanvas.parentElement === mount
+            rendererCanvas.parentElement ===
+            mount
           ) {
-            mount.removeChild(rendererCanvas);
+            mount.removeChild(
+              rendererCanvas
+            );
           }
         }
       } catch {
@@ -1532,13 +2252,13 @@ export default function Scene3DBackground() {
       aria-hidden="true"
       className="pointer-events-none fixed inset-0 z-0 overflow-hidden"
     >
-      {/* Soft atmospheric lighting behind the WebGL scene. */}
+      {/* Atmospheric AI lighting. */}
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_42%,rgba(76,125,255,0.10),transparent_28%),radial-gradient(circle_at_20%_60%,rgba(139,92,246,0.07),transparent_30%),radial-gradient(circle_at_80%_35%,rgba(53,217,255,0.06),transparent_28%)]" />
 
-      {/* Cinematic edge vignette. */}
+      {/* Cinematic vignette. */}
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_center,transparent_38%,rgba(3,4,9,0.48)_100%)]" />
 
-      {/* Very subtle scan-line texture. */}
+      {/* Subtle holographic scan lines. */}
       <div
         className="pointer-events-none absolute inset-0 opacity-[0.035]"
         style={{
