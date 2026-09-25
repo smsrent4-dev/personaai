@@ -37,3 +37,5 @@ aiosqlite==0.20.0
 pytest==8.3.3
 pytest-asyncio==0.24.0
 respx==0.21.1
+
+cloudinary
