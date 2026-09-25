@@ -22,9 +22,7 @@ import PlatformBadge from "@/components/PlatformBadge";
 type ChannelFilter = "all" | Platform;
 
 export default function ConversationsPage() {
-  const [filter, setFilter] =
-    useState<ChannelFilter>("all");
-
+  const [filter, setFilter] = useState<ChannelFilter>("all");
   const [search, setSearch] = useState("");
 
   const {
@@ -37,9 +35,7 @@ export default function ConversationsPage() {
     queryKey: ["conversations"],
     queryFn: async () =>
       (
-        await api.get<Conversation[]>(
-          "/conversations",
-        )
+        await api.get<Conversation[]>("/conversations")
       ).data,
   });
 
@@ -48,8 +44,7 @@ export default function ConversationsPage() {
       Array.from(
         new Set(
           conversations.map(
-            (conversation) =>
-              conversation.platform,
+            (conversation) => conversation.platform,
           ),
         ),
       ) as Platform[],
@@ -73,18 +68,16 @@ export default function ConversationsPage() {
       }
 
       const name =
-        conversation.external_user_name ??
-        "";
+        conversation.external_user_name ?? "";
 
       const externalId =
-        conversation.external_conversation_id ??
-        "";
+        conversation.external_conversation_id ?? "";
 
       const platform =
         conversation.platform ?? "";
 
       const status =
-        conversation.status ?? "";
+        String(conversation.status ?? "");
 
       return (
         name.toLowerCase().includes(query) ||
@@ -93,22 +86,46 @@ export default function ConversationsPage() {
         status.toLowerCase().includes(query)
       );
     });
-  }, [
-    conversations,
-    filter,
-    search,
-  ]);
+  }, [conversations, filter, search]);
+
+  /*
+   * Convert the backend enum to a plain string before
+   * checking display categories.
+   *
+   * This prevents TS2367 when your ConversationStatus
+   * type doesn't explicitly contain "active", "waiting",
+   * or "pending".
+   */
+  const getStatusString = (
+    conversation: Conversation,
+  ): string => {
+    return String(
+      conversation.status ?? "unknown",
+    ).toLowerCase();
+  };
 
   const activeCount = conversations.filter(
-    (conversation) =>
-      conversation.status === "active" ||
-      conversation.status === "open",
+    (conversation) => {
+      const status =
+        getStatusString(conversation);
+
+      return (
+        status === "active" ||
+        status === "open"
+      );
+    },
   ).length;
 
   const waitingCount = conversations.filter(
-    (conversation) =>
-      conversation.status === "waiting" ||
-      conversation.status === "pending",
+    (conversation) => {
+      const status =
+        getStatusString(conversation);
+
+      return (
+        status === "waiting" ||
+        status === "pending"
+      );
+    },
   ).length;
 
   const platformCount =
@@ -116,6 +133,11 @@ export default function ConversationsPage() {
 
   const clearSearch = () => {
     setSearch("");
+  };
+
+  const clearFilters = () => {
+    setSearch("");
+    setFilter("all");
   };
 
   return (
@@ -131,10 +153,7 @@ export default function ConversationsPage() {
         className="pointer-events-none absolute left-0 top-72 -z-10 h-64 w-64 rounded-full bg-accent-blue/5 blur-3xl"
       />
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Header                                                              */}
-      {/* ------------------------------------------------------------------ */}
-
+      {/* Header */}
       <section className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
         <div className="min-w-0">
           <div className="mb-2 flex items-center gap-2">
@@ -165,20 +184,14 @@ export default function ConversationsPage() {
         >
           <RefreshCw
             className={`h-3.5 w-3.5 ${
-              isFetching
-                ? "animate-spin"
-                : ""
+              isFetching ? "animate-spin" : ""
             }`}
           />
-
           Refresh
         </button>
       </section>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Stats                                                               */}
-      {/* ------------------------------------------------------------------ */}
-
+      {/* Stats */}
       <section className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatCard
           icon={Inbox}
@@ -209,10 +222,7 @@ export default function ConversationsPage() {
         />
       </section>
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Main inbox                                                          */}
-      {/* ------------------------------------------------------------------ */}
-
+      {/* Main inbox */}
       <section className="panel overflow-hidden">
         {/* Toolbar */}
         <div className="border-b border-base-border p-3 sm:p-4">
@@ -222,11 +232,13 @@ export default function ConversationsPage() {
               <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-faint" />
 
               <input
+                type="search"
                 value={search}
                 onChange={(event) =>
                   setSearch(event.target.value)
                 }
                 placeholder="Search conversations..."
+                aria-label="Search conversations"
                 className="h-11 w-full rounded-xl border border-base-border bg-base-panel-2 pl-10 pr-10 text-sm text-ink outline-none transition-all duration-200 placeholder:text-ink-faint focus:border-accent-violet/50 focus:ring-2 focus:ring-accent-violet/10"
               />
 
@@ -244,15 +256,16 @@ export default function ConversationsPage() {
 
             {/* Channel filters */}
             <div className="flex min-w-0 items-center gap-2 overflow-x-auto pb-0.5 scrollbar-none">
-              <div className="mr-1 flex h-9 shrink-0 items-center justify-center rounded-lg bg-base-panel-2 px-2.5">
+              <div
+                className="mr-1 flex h-9 shrink-0 items-center justify-center rounded-lg bg-base-panel-2 px-2.5"
+                aria-hidden="true"
+              >
                 <SlidersHorizontal className="h-3.5 w-3.5 text-ink-faint" />
               </div>
 
               <FilterButton
                 active={filter === "all"}
-                onClick={() =>
-                  setFilter("all")
-                }
+                onClick={() => setFilter("all")}
               >
                 All
               </FilterButton>
@@ -261,9 +274,7 @@ export default function ConversationsPage() {
                 (platform) => (
                   <FilterButton
                     key={platform}
-                    active={
-                      filter === platform
-                    }
+                    active={filter === platform}
                     onClick={() =>
                       setFilter(platform)
                     }
@@ -271,6 +282,7 @@ export default function ConversationsPage() {
                     <PlatformBadge
                       platform={platform}
                     />
+
                     <span className="capitalize">
                       {platform}
                     </span>
@@ -292,14 +304,10 @@ export default function ConversationsPage() {
                 : "conversations"}
             </p>
 
-            {(search ||
-              filter !== "all") && (
+            {(search || filter !== "all") && (
               <button
                 type="button"
-                onClick={() => {
-                  setSearch("");
-                  setFilter("all");
-                }}
+                onClick={clearFilters}
                 className="text-[11px] font-medium text-accent-violet transition-colors hover:text-accent-blue"
               >
                 Clear filters
@@ -333,10 +341,7 @@ export default function ConversationsPage() {
           conversations.length > 0 &&
           filtered.length === 0 && (
             <NoResultsState
-              onClear={() => {
-                setSearch("");
-                setFilter("all");
-              }}
+              onClear={clearFilters}
             />
           )}
 
@@ -460,15 +465,19 @@ function ConversationRow({
 }) {
   const displayName =
     conversation.external_user_name?.trim() ||
-    conversation.external_conversation_id;
+    conversation.external_conversation_id ||
+    "Unknown customer";
 
   const initial =
-    displayName?.charAt(0)?.toUpperCase() ||
-    "?";
+    displayName.charAt(0).toUpperCase() || "?";
 
-  const status =
-    conversation.status?.toLowerCase() ||
-    "unknown";
+  /*
+   * Convert the enum value to a string before
+   * comparing it with UI categories.
+   */
+  const status = String(
+    conversation.status ?? "unknown",
+  ).toLowerCase();
 
   const isActive =
     status === "active" ||
@@ -489,7 +498,7 @@ function ConversationRow({
         )}ms`,
       }}
     >
-      {/* Active hover indicator */}
+      {/* Hover indicator */}
       <div className="absolute bottom-0 left-0 top-0 w-0.5 origin-bottom scale-y-0 bg-gradient-to-b from-accent-violet to-accent-blue transition-transform duration-300 group-hover:scale-y-100" />
 
       <div className="flex items-center gap-3 sm:gap-4">
@@ -499,7 +508,7 @@ function ConversationRow({
             {initial}
           </div>
 
-          {/* Online/status dot */}
+          {/* Status dot */}
           <span
             className={`absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-base-panel ${
               isActive
@@ -531,7 +540,9 @@ function ConversationRow({
                 />
 
                 <span className="hidden truncate text-[10px] text-ink-faint sm:inline">
-                  {conversation.external_conversation_id}
+                  {
+                    conversation.external_conversation_id
+                  }
                 </span>
               </div>
             </div>
@@ -553,14 +564,14 @@ function ConversationRow({
 
           {/* Bottom metadata */}
           <div className="mt-2 flex items-center gap-2">
-            <StatusBadge
-              status={status}
-            />
+            <StatusBadge status={status} />
 
             <span className="h-1 w-1 shrink-0 rounded-full bg-ink-faint/50" />
 
             <span className="truncate text-[10px] capitalize text-ink-faint">
-              {conversation.platform}
+              {String(
+                conversation.platform,
+              )}
             </span>
           </div>
         </div>
@@ -585,8 +596,7 @@ function StatusBadge({
 }: {
   status: string;
 }) {
-  const normalized =
-    status.toLowerCase();
+  const normalized = status.toLowerCase();
 
   const isActive =
     normalized === "active" ||
@@ -599,12 +609,18 @@ function StatusBadge({
   let className =
     "bg-ink-faint/10 text-ink-faint ring-ink-faint/10";
 
+  let dotClassName = "bg-ink-faint";
+
   if (isActive) {
     className =
       "bg-accent-green/10 text-accent-green ring-accent-green/15";
+
+    dotClassName = "bg-accent-green";
   } else if (isWaiting) {
     className =
       "bg-accent-amber/10 text-accent-amber ring-accent-amber/15";
+
+    dotClassName = "bg-accent-amber";
   }
 
   return (
@@ -612,13 +628,7 @@ function StatusBadge({
       className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[9px] font-semibold capitalize ring-1 ${className}`}
     >
       <span
-        className={`h-1.5 w-1.5 rounded-full ${
-          isActive
-            ? "bg-accent-green"
-            : isWaiting
-              ? "bg-accent-amber"
-              : "bg-ink-faint"
-        }`}
+        className={`h-1.5 w-1.5 rounded-full ${dotClassName}`}
       />
 
       {status}
