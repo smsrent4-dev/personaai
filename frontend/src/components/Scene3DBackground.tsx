@@ -1,101 +1,548 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 
-/**
- * PersonaAI — Procedural 3D Agent Background
- *
- * Four autonomous AI agents:
- *   • Personal
- *   • Sales
- *   • Support
- *   • Opportunity
- *
- * Features:
- *   - Pure Three.js
- *   - No external 3D assets
- *   - No GLB/GLTF downloads
- *   - Procedurally generated humanoid AI agents
- *   - Floating / breathing / rotating animation
- *   - Glowing chest AI cores
- *   - Orbital rings
- *   - Neural connection lines
- *   - Ambient particles
- *   - Responsive camera
- *   - prefers-reduced-motion support
- *   - WebGL feature detection
- *   - WebGL context-loss protection
- *   - StrictMode-safe cleanup
- *   - Renderer.forceContextLoss()
- *
- * This is a stylized futuristic 3D scene rather than a
- * photorealistic humanoid model. Realistic characters would
- * require external GLB/GLTF assets.
- */
+type AgentName = "PERSONAL" | "SALES" | "SUPPORT" | "OPPORTUNITY";
 
-type AgentConfig = {
-  name: string;
-  position: THREE.Vector3;
-  scale: number;
-  phase: number;
-  orbitRadius: number;
+interface AgentNode {
+  name: AgentName;
+  angle: number;
+  radius: number;
   color: number;
-};
+  position: THREE.Vector3;
+  mesh: THREE.Mesh;
+  glow: THREE.Mesh;
+  pulse: number;
+}
 
-type AgentRuntime = {
-  root: THREE.Group;
-  body: THREE.Group;
-  head: THREE.Group;
-  core: THREE.Mesh;
-  coreLight: THREE.PointLight;
-  rings: THREE.Group;
-  particles: THREE.Points;
-  baseY: number;
+interface DataPacket {
+  line: THREE.Line;
+  start: THREE.Vector3;
+  end: THREE.Vector3;
+  progress: number;
+  speed: number;
+}
+
+interface Panel {
+  group: THREE.Group;
+  angle: number;
+  radius: number;
   phase: number;
-  orbitRadius: number;
+}
+
+const COLORS = {
+  cyan: 0x35d9ff,
+  blue: 0x4c7dff,
+  violet: 0x8b5cf6,
+  purple: 0xa855f7,
+  white: 0xeaf6ff,
+  green: 0x39ff9a,
+  amber: 0xffc857,
+  dark: 0x050812,
 };
 
-const AGENTS: AgentConfig[] = [
-  {
-    name: "Personal",
-    position: new THREE.Vector3(-5.4, 2.2, 0.2),
-    scale: 1,
-    phase: 0,
-    orbitRadius: 0.12,
-    color: 0x8b5cf6,
-  },
-  {
-    name: "Sales",
-    position: new THREE.Vector3(5.1, 2.6, -0.4),
-    scale: 0.95,
-    phase: 2.1,
-    orbitRadius: 0.16,
-    color: 0x3b82f6,
-  },
-  {
-    name: "Support",
-    position: new THREE.Vector3(-5, -2.8, -0.2),
-    scale: 0.92,
-    phase: 4,
-    orbitRadius: 0.14,
-    color: 0x22c55e,
-  },
-  {
-    name: "Opportunity",
-    position: new THREE.Vector3(5, -2.6, 0.4),
-    scale: 0.92,
-    phase: 5.3,
-    orbitRadius: 0.18,
-    color: 0xf59e0b,
-  },
+const AGENTS: Array<{
+  name: AgentName;
+  color: number;
+}> = [
+  { name: "PERSONAL", color: COLORS.cyan },
+  { name: "SALES", color: COLORS.violet },
+  { name: "SUPPORT", color: COLORS.blue },
+  { name: "OPPORTUNITY", color: COLORS.green },
 ];
 
+function isWebGLAvailable(): boolean {
+  try {
+    const canvas = document.createElement("canvas");
+
+    const context =
+      canvas.getContext("webgl2") ||
+      canvas.getContext("webgl") ||
+      canvas.getContext("experimental-webgl");
+
+    return Boolean(context);
+  } catch {
+    return false;
+  }
+}
+
+function disposeMaterial(material: THREE.Material): void {
+  const materialWithMaps = material as THREE.Material & {
+    map?: THREE.Texture | null;
+    alphaMap?: THREE.Texture | null;
+    normalMap?: THREE.Texture | null;
+    roughnessMap?: THREE.Texture | null;
+    metalnessMap?: THREE.Texture | null;
+    emissiveMap?: THREE.Texture | null;
+  };
+
+  const textures = [
+    materialWithMaps.map,
+    materialWithMaps.alphaMap,
+    materialWithMaps.normalMap,
+    materialWithMaps.roughnessMap,
+    materialWithMaps.metalnessMap,
+    materialWithMaps.emissiveMap,
+  ];
+
+  const uniqueTextures = new Set<THREE.Texture>();
+
+  textures.forEach((texture) => {
+    if (texture) {
+      uniqueTextures.add(texture);
+    }
+  });
+
+  uniqueTextures.forEach((texture) => texture.dispose());
+
+  material.dispose();
+}
+
+function disposeObject3D(root: THREE.Object3D): void {
+  root.traverse((object) => {
+    const mesh = object as THREE.Mesh;
+
+    if (mesh.geometry) {
+      mesh.geometry.dispose();
+    }
+
+    const material = mesh.material;
+
+    if (Array.isArray(material)) {
+      material.forEach(disposeMaterial);
+    } else if (material) {
+      disposeMaterial(material);
+    }
+  });
+}
+
+function makeLine(
+  points: THREE.Vector3[],
+  color: number,
+  opacity = 0.45
+): THREE.Line {
+  const geometry = new THREE.BufferGeometry().setFromPoints(points);
+
+  const material = new THREE.LineBasicMaterial({
+    color,
+    transparent: true,
+    opacity,
+    depthWrite: false,
+  });
+
+  return new THREE.Line(geometry, material);
+}
+
+function makeLineSegments(
+  positions: number[],
+  color: number,
+  opacity = 0.35
+): THREE.LineSegments {
+  const geometry = new THREE.BufferGeometry();
+
+  geometry.setAttribute(
+    "position",
+    new THREE.Float32BufferAttribute(positions, 3)
+  );
+
+  const material = new THREE.LineBasicMaterial({
+    color,
+    transparent: true,
+    opacity,
+    depthWrite: false,
+  });
+
+  return new THREE.LineSegments(geometry, material);
+}
+
+function makeGlowSphere(
+  radius: number,
+  color: number,
+  opacity: number
+): THREE.Mesh {
+  const geometry = new THREE.SphereGeometry(radius, 24, 24);
+
+  const material = new THREE.MeshBasicMaterial({
+    color,
+    transparent: true,
+    opacity,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+
+  return new THREE.Mesh(geometry, material);
+}
+
+function createPanel(
+  color: number,
+  width = 2.8,
+  height = 1.55
+): THREE.Group {
+  const group = new THREE.Group();
+
+  const background = new THREE.Mesh(
+    new THREE.PlaneGeometry(width, height),
+    new THREE.MeshBasicMaterial({
+      color: COLORS.dark,
+      transparent: true,
+      opacity: 0.45,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    })
+  );
+
+  group.add(background);
+
+  const border = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.PlaneGeometry(width, height)),
+    new THREE.LineBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.6,
+      depthWrite: false,
+    })
+  );
+
+  group.add(border);
+
+  // Header line.
+  const header = new THREE.Mesh(
+    new THREE.PlaneGeometry(width * 0.56, 0.035),
+    new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.8,
+      depthWrite: false,
+    })
+  );
+
+  header.position.set(-width * 0.18, height * 0.28, 0.015);
+  group.add(header);
+
+  // Small system indicators.
+  for (let i = 0; i < 5; i += 1) {
+    const indicator = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.12, 0.12),
+      new THREE.MeshBasicMaterial({
+        color: i === 0 ? COLORS.green : color,
+        transparent: true,
+        opacity: i === 0 ? 0.9 : 0.45,
+        depthWrite: false,
+      })
+    );
+
+    indicator.position.set(
+      -width * 0.36 + i * 0.2,
+      height * 0.42,
+      0.02
+    );
+
+    group.add(indicator);
+  }
+
+  // Data bars.
+  const barWidths = [0.42, 0.72, 0.54, 0.88, 0.62];
+
+  barWidths.forEach((barWidth, index) => {
+    const bar = new THREE.Mesh(
+      new THREE.PlaneGeometry(barWidth, 0.045),
+      new THREE.MeshBasicMaterial({
+        color,
+        transparent: true,
+        opacity: 0.3 + index * 0.08,
+        depthWrite: false,
+      })
+    );
+
+    bar.position.set(
+      -width * 0.22 + barWidth / 2,
+      height * 0.12 - index * 0.16,
+      0.02
+    );
+
+    group.add(bar);
+  });
+
+  // Mini graph.
+  const graphPoints: THREE.Vector3[] = [];
+
+  for (let i = 0; i < 7; i += 1) {
+    const x = -width * 0.38 + i * (width * 0.11);
+    const y =
+      -height * 0.28 +
+      Math.sin(i * 1.35) * 0.08 +
+      (i % 3) * 0.035;
+
+    graphPoints.push(new THREE.Vector3(x, y, 0.03));
+  }
+
+  group.add(makeLine(graphPoints, color, 0.55));
+
+  return group;
+}
+
+function createRadar(color: number): THREE.Group {
+  const group = new THREE.Group();
+
+  const radii = [1.8, 2.45, 3.1];
+
+  radii.forEach((radius, index) => {
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(radius - 0.008, radius, 96),
+      new THREE.MeshBasicMaterial({
+        color,
+        transparent: true,
+        opacity: 0.12 - index * 0.025,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      })
+    );
+
+    ring.rotation.x = Math.PI / 2;
+    group.add(ring);
+  });
+
+  const divisions = 16;
+  const positions: number[] = [];
+
+  for (let i = 0; i < divisions; i += 1) {
+    const angle = (i / divisions) * Math.PI * 2;
+
+    const x1 = Math.cos(angle) * 1.8;
+    const z1 = Math.sin(angle) * 1.8;
+
+    const x2 = Math.cos(angle) * 3.1;
+    const z2 = Math.sin(angle) * 3.1;
+
+    positions.push(x1, 0, z1, x2, 0, z2);
+  }
+
+  group.add(makeLineSegments(positions, color, 0.12));
+
+  return group;
+}
+
+function createCentralCore(): THREE.Group {
+  const group = new THREE.Group();
+
+  // Outer energy halo.
+  const halo = new THREE.Mesh(
+    new SphereGeometrySafe(1.65),
+    new THREE.MeshBasicMaterial({
+      color: COLORS.blue,
+      transparent: true,
+      opacity: 0.035,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    })
+  );
+
+  group.add(halo);
+
+  // Outer rotating cage.
+  const outerCage = new THREE.Mesh(
+    new THREE.IcosahedronGeometry(1.45, 1),
+    new THREE.MeshBasicMaterial({
+      color: COLORS.cyan,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.3,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    })
+  );
+
+  group.add(outerCage);
+
+  // Secondary cage.
+  const innerCage = new THREE.Mesh(
+    new THREE.DodecahedronGeometry(1.05, 1),
+    new THREE.MeshBasicMaterial({
+      color: COLORS.violet,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.4,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    })
+  );
+
+  group.add(innerCage);
+
+  // Central reactor.
+  const reactor = new THREE.Mesh(
+    new THREE.IcosahedronGeometry(0.72, 3),
+    new THREE.MeshBasicMaterial({
+      color: COLORS.cyan,
+      transparent: true,
+      opacity: 0.65,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    })
+  );
+
+  group.add(reactor);
+
+  // Bright inner core.
+  const core = new THREE.Mesh(
+    new THREE.SphereGeometry(0.38, 32, 32),
+    new THREE.MeshBasicMaterial({
+      color: COLORS.white,
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    })
+  );
+
+  group.add(core);
+
+  // Core glow.
+  const glow1 = makeGlowSphere(0.58, COLORS.cyan, 0.08);
+  const glow2 = makeGlowSphere(0.82, COLORS.violet, 0.035);
+
+  group.add(glow1);
+  group.add(glow2);
+
+  // Energy rings.
+  const ringSpecs = [
+    { radius: 1.75, tube: 0.018, color: COLORS.cyan },
+    { radius: 1.45, tube: 0.012, color: COLORS.violet },
+    { radius: 1.12, tube: 0.009, color: COLORS.blue },
+  ];
+
+  ringSpecs.forEach((spec, index) => {
+    const ring = new THREE.Mesh(
+      new THREE.TorusGeometry(spec.radius, spec.tube, 8, 128),
+      new THREE.MeshBasicMaterial({
+        color: spec.color,
+        transparent: true,
+        opacity: 0.6,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      })
+    );
+
+    ring.rotation.set(
+      index === 0 ? 0.3 : 1.0,
+      index === 1 ? 0.8 : 0.2,
+      index * 0.6
+    );
+
+    group.add(ring);
+  });
+
+  return group;
+}
+
+function SphereGeometrySafe(radius: number): THREE.SphereGeometry {
+  return new THREE.SphereGeometry(radius, 24, 24);
+}
+
+function createScanArc(
+  radius: number,
+  color: number,
+  startAngle: number,
+  length: number
+): THREE.Mesh {
+  return new THREE.Mesh(
+    new THREE.RingGeometry(
+      radius - 0.018,
+      radius,
+      128,
+      1,
+      startAngle,
+      length
+    ),
+    new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.65,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    })
+  );
+}
+
+function createEnvironmentGrid(): THREE.Group {
+  const group = new THREE.Group();
+
+  const size = 28;
+  const divisions = 28;
+  const positions: number[] = [];
+
+  for (let i = 0; i <= divisions; i += 1) {
+    const value = -size / 2 + (i / divisions) * size;
+
+    positions.push(value, -3.3, -size / 2);
+    positions.push(value, -3.3, size / 2);
+
+    positions.push(-size / 2, -3.3, value);
+    positions.push(size / 2, -3.3, value);
+  }
+
+  const grid = makeLineSegments(positions, COLORS.blue, 0.065);
+  group.add(grid);
+
+  return group;
+}
+
+function createConnection(
+  start: THREE.Vector3,
+  end: THREE.Vector3,
+  color: number
+): THREE.Line {
+  const middle = new THREE.Vector3()
+    .addVectors(start, end)
+    .multiplyScalar(0.5);
+
+  middle.y += 0.65;
+
+  const curve = new THREE.QuadraticBezierCurve3(start, middle, end);
+
+  const points = curve.getPoints(32);
+
+  return makeLine(points, color, 0.28);
+}
+
+function createDataPacket(
+  start: THREE.Vector3,
+  end: THREE.Vector3,
+  color: number,
+  index: number
+): DataPacket {
+  const geometry = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(),
+    new THREE.Vector3(0.055, 0, 0),
+  ]);
+
+  const material = new THREE.LineBasicMaterial({
+    color,
+    transparent: true,
+    opacity: 0.95,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+
+  const line = new THREE.Line(geometry, material);
+
+  return {
+    line,
+    start,
+    end,
+    progress: (index * 0.23) % 1,
+    speed: 0.0008 + (index % 3) * 0.00025,
+  };
+}
+
 export default function Scene3DBackground() {
-  const containerRef = useRef<HTMLDivElement>(null);
+  const mountRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    const container = containerRef.current;
+    const mount = mountRef.current;
 
-    if (!container) {
+    if (!mount) {
       return;
     }
 
@@ -104,76 +551,48 @@ export default function Scene3DBackground() {
     }
 
     let renderer: THREE.WebGLRenderer | null = null;
-    let frameId: number | null = null;
+    let scene: THREE.Scene | null = null;
+    let camera: THREE.PerspectiveCamera | null = null;
 
-    let disposed = false;
+    let animationFrame = 0;
+    let destroyed = false;
     let contextLost = false;
 
     const cleanupCallbacks: Array<() => void> = [];
 
     try {
-      const prefersReducedMotion = window.matchMedia(
-        "(prefers-reduced-motion: reduce)",
-      ).matches;
+      scene = new THREE.Scene();
 
-      const width = Math.max(container.clientWidth, 1);
-      const height = Math.max(container.clientHeight, 1);
+      scene.fog = new THREE.FogExp2(0x05060b, 0.028);
 
-      // ------------------------------------------------------------
-      // Scene
-      // ------------------------------------------------------------
-
-      const scene = new THREE.Scene();
-
-      scene.fog = new THREE.FogExp2(0x050507, 0.025);
-
-      // ------------------------------------------------------------
-      // Camera
-      // ------------------------------------------------------------
-
-      const camera = new THREE.PerspectiveCamera(
-        48,
-        width / height,
-        0.1,
-        100,
-      );
-
-      camera.position.set(0, 0, 15);
-
-      // ------------------------------------------------------------
-      // Renderer
-      // ------------------------------------------------------------
+      camera = new THREE.PerspectiveCamera(48, 1, 0.1, 100);
+      camera.position.set(0, 1.2, 12);
 
       renderer = new THREE.WebGLRenderer({
         antialias: true,
         alpha: true,
         powerPreference: "high-performance",
-        depth: true,
+        depth: false,
         stencil: false,
+        preserveDrawingBuffer: false,
       });
 
-      renderer.setSize(width, height);
-
       renderer.setPixelRatio(
-        Math.min(window.devicePixelRatio || 1, 1.75),
+        Math.min(window.devicePixelRatio || 1, 1.65)
       );
 
       renderer.setClearColor(0x000000, 0);
 
-      renderer.domElement.style.display = "block";
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+      mount.appendChild(renderer.domElement);
+
       renderer.domElement.style.width = "100%";
       renderer.domElement.style.height = "100%";
+      renderer.domElement.style.display = "block";
+      renderer.domElement.style.pointerEvents = "none";
 
-      renderer.domElement.setAttribute(
-        "aria-hidden",
-        "true",
-      );
-
-      container.appendChild(renderer.domElement);
-
-      // ------------------------------------------------------------
-      // WebGL context protection
-      // ------------------------------------------------------------
+      const canvas = renderer.domElement;
 
       const handleContextLost = (event: Event) => {
         event.preventDefault();
@@ -181,1787 +600,952 @@ export default function Scene3DBackground() {
       };
 
       const handleContextRestored = () => {
-        if (!disposed) {
-          contextLost = false;
-        }
+        contextLost = false;
       };
 
-      renderer.domElement.addEventListener(
+      canvas.addEventListener(
         "webglcontextlost",
         handleContextLost,
-        false,
+        false
       );
 
-      renderer.domElement.addEventListener(
+      canvas.addEventListener(
         "webglcontextrestored",
         handleContextRestored,
-        false,
+        false
       );
 
       cleanupCallbacks.push(() => {
-        renderer?.domElement.removeEventListener(
+        canvas.removeEventListener(
           "webglcontextlost",
-          handleContextLost,
+          handleContextLost
         );
 
-        renderer?.domElement.removeEventListener(
+        canvas.removeEventListener(
           "webglcontextrestored",
-          handleContextRestored,
+          handleContextRestored
         );
       });
 
-      // ------------------------------------------------------------
-      // Lighting
-      // ------------------------------------------------------------
+      /*
+       * ------------------------------------------------------------
+       * LIGHTING
+       * ------------------------------------------------------------
+       */
 
-      const ambientLight = new THREE.AmbientLight(
-        0x6b7280,
-        0.65,
-      );
-
+      const ambientLight = new THREE.AmbientLight(0x3854a8, 0.7);
       scene.add(ambientLight);
 
-      const keyLight = new THREE.PointLight(
-        0x8b5cf6,
+      const cyanLight = new THREE.PointLight(
+        COLORS.cyan,
         8,
-        22,
-        2,
-      );
-
-      keyLight.position.set(0, 1, 5);
-
-      scene.add(keyLight);
-
-      const blueLight = new THREE.PointLight(
-        0x3b82f6,
-        5,
         18,
-        2,
+        2
       );
 
-      blueLight.position.set(6, 2, 2);
-
-      scene.add(blueLight);
+      cyanLight.position.set(0, 1, 1);
+      scene.add(cyanLight);
 
       const violetLight = new THREE.PointLight(
-        0x8b5cf6,
-        4,
-        18,
-        2,
+        COLORS.violet,
+        7,
+        16,
+        2
       );
 
-      violetLight.position.set(-6, -1, 2);
-
+      violetLight.position.set(-4, 1.5, -2);
       scene.add(violetLight);
 
-      // ------------------------------------------------------------
-      // Central AI Core
-      // ------------------------------------------------------------
+      const blueLight = new THREE.PointLight(
+        COLORS.blue,
+        6,
+        18,
+        2
+      );
 
-      const centralSystem = createCentralAI();
+      blueLight.position.set(4, 0.5, -3);
+      scene.add(blueLight);
 
-      scene.add(centralSystem.group);
+      /*
+       * ------------------------------------------------------------
+       * ROOT GROUPS
+       * ------------------------------------------------------------
+       */
 
-      // ------------------------------------------------------------
-      // Neural connections
-      // ------------------------------------------------------------
+      const world = new THREE.Group();
+      scene.add(world);
 
-      const connectionGroup = createConnections();
+      const coreSystem = new THREE.Group();
+      coreSystem.position.y = 0.55;
+      world.add(coreSystem);
 
-      scene.add(connectionGroup);
+      const core = createCentralCore();
+      coreSystem.add(core);
 
-      // ------------------------------------------------------------
-      // Agents
-      // ------------------------------------------------------------
+      /*
+       * ------------------------------------------------------------
+       * RADAR / HUD RINGS
+       * ------------------------------------------------------------
+       */
 
-      const agents: AgentRuntime[] = [];
+      const radar = createRadar(COLORS.cyan);
+      radar.position.y = -0.15;
+      world.add(radar);
 
-      for (const config of AGENTS) {
-        const agent = createAgent(config);
+      const largeRing = new THREE.Mesh(
+        new THREE.TorusGeometry(3.85, 0.012, 8, 160),
+        new THREE.MeshBasicMaterial({
+          color: COLORS.blue,
+          transparent: true,
+          opacity: 0.24,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+        })
+      );
 
-        agents.push(agent);
+      largeRing.rotation.x = Math.PI / 2;
+      largeRing.position.y = -0.1;
+      world.add(largeRing);
 
-        scene.add(agent.root);
+      /*
+       * ------------------------------------------------------------
+       * SCANNING ARCS
+       * ------------------------------------------------------------
+       */
+
+      const scanArcs = [
+        createScanArc(2.0, COLORS.cyan, 0.2, 1.3),
+        createScanArc(2.7, COLORS.violet, 2.2, 0.9),
+        createScanArc(3.35, COLORS.blue, 4.0, 1.15),
+      ];
+
+      scanArcs.forEach((arc, index) => {
+        arc.rotation.x = Math.PI / 2;
+        arc.position.y = 0.05 + index * 0.025;
+        world.add(arc);
+      });
+
+      /*
+       * ------------------------------------------------------------
+       * VERTICAL HOLOGRAPHIC BEAM
+       * ------------------------------------------------------------
+       */
+
+      const beam = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.28, 0.55, 7, 32, 1, true),
+        new THREE.MeshBasicMaterial({
+          color: COLORS.cyan,
+          transparent: true,
+          opacity: 0.025,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+        })
+      );
+
+      beam.position.set(0, 0.7, 0);
+      world.add(beam);
+
+      /*
+       * ------------------------------------------------------------
+       * AGENT NETWORK
+       * ------------------------------------------------------------
+       */
+
+      const agentGroup = new THREE.Group();
+      world.add(agentGroup);
+
+      const agents: AgentNode[] = [];
+
+      const desktopRadius = 5.1;
+
+      AGENTS.forEach((agent, index) => {
+        const angle =
+          -Math.PI / 2 + (index / AGENTS.length) * Math.PI * 2;
+
+        const position = new THREE.Vector3(
+          Math.cos(angle) * desktopRadius,
+          0.35 + Math.sin(index * 1.4) * 0.3,
+          Math.sin(angle) * desktopRadius
+        );
+
+        const mesh = new THREE.Mesh(
+          new THREE.OctahedronGeometry(0.23, 1),
+          new THREE.MeshBasicMaterial({
+            color: agent.color,
+            wireframe: true,
+            transparent: true,
+            opacity: 0.85,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending,
+          })
+        );
+
+        mesh.position.copy(position);
+
+        const glow = makeGlowSphere(0.6, agent.color, 0.05);
+        glow.position.copy(position);
+
+        agentGroup.add(mesh);
+        agentGroup.add(glow);
+
+        agents.push({
+          name: agent.name,
+          angle,
+          radius: desktopRadius,
+          color: agent.color,
+          position,
+          mesh,
+          glow,
+          pulse: index * 1.4,
+        });
+      });
+
+      /*
+       * ------------------------------------------------------------
+       * NETWORK CONNECTIONS
+       * ------------------------------------------------------------
+       */
+
+      const connections = new THREE.Group();
+      world.add(connections);
+
+      const dataPackets: DataPacket[] = [];
+
+      agents.forEach((agent, index) => {
+        const start = new THREE.Vector3(0, 0.55, 0);
+
+        const end = agent.position.clone();
+
+        const connection = createConnection(
+          start,
+          end,
+          agent.color
+        );
+
+        connections.add(connection);
+
+        for (let packetIndex = 0; packetIndex < 2; packetIndex += 1) {
+          const packet = createDataPacket(
+            start,
+            end,
+            agent.color,
+            index * 2 + packetIndex
+          );
+
+          connections.add(packet.line);
+          dataPackets.push(packet);
+        }
+      });
+
+      // Secondary network between agents.
+      for (let i = 0; i < agents.length; i += 1) {
+        const current = agents[i];
+        const next = agents[(i + 1) % agents.length];
+
+        const secondary = createConnection(
+          current.position,
+          next.position,
+          COLORS.blue
+        );
+
+        const material = secondary.material as THREE.LineBasicMaterial;
+        material.opacity = 0.12;
+
+        connections.add(secondary);
       }
 
-      // ------------------------------------------------------------
-      // Ambient particles
-      // ------------------------------------------------------------
+      /*
+       * ------------------------------------------------------------
+       * HOLOGRAPHIC DATA PANELS
+       * ------------------------------------------------------------
+       */
 
-      const particleSystem =
-        createAmbientParticles();
+      const panelsGroup = new THREE.Group();
+      world.add(panelsGroup);
 
-      scene.add(particleSystem);
+      const panels: Panel[] = [];
 
-      // ------------------------------------------------------------
-      // Environment grid
-      // ------------------------------------------------------------
+      const panelDefinitions = [
+        {
+          angle: -2.55,
+          radius: 6.4,
+          color: COLORS.cyan,
+          scale: 0.9,
+        },
+        {
+          angle: -0.55,
+          radius: 6.5,
+          color: COLORS.violet,
+          scale: 0.82,
+        },
+        {
+          angle: 0.58,
+          radius: 6.3,
+          color: COLORS.blue,
+          scale: 0.84,
+        },
+        {
+          angle: 2.6,
+          radius: 6.2,
+          color: COLORS.green,
+          scale: 0.88,
+        },
+      ];
 
-      const grid = createEnvironmentGrid();
+      panelDefinitions.forEach((definition, index) => {
+        const panel = createPanel(definition.color);
 
-      scene.add(grid);
+        panel.scale.setScalar(definition.scale);
 
-      // ------------------------------------------------------------
-      // Animation
-      // ------------------------------------------------------------
+        panel.position.set(
+          Math.cos(definition.angle) * definition.radius,
+          1.3 + Math.sin(index * 2.1) * 0.5,
+          Math.sin(definition.angle) * definition.radius
+        );
 
-      const clock = new THREE.Clock();
+        panel.lookAt(0, 1.1, 0);
 
-      let elapsed = 0;
+        panelsGroup.add(panel);
 
-      const animate = () => {
-        if (disposed) {
-          return;
-        }
+        panels.push({
+          group: panel,
+          angle: definition.angle,
+          radius: definition.radius,
+          phase: index * 1.8,
+        });
+      });
 
-        frameId =
-          window.requestAnimationFrame(animate);
+      /*
+       * ------------------------------------------------------------
+       * AMBIENT PARTICLES
+       * ------------------------------------------------------------
+       */
 
-        if (contextLost || !renderer) {
-          return;
-        }
+      const particleCount = window.innerWidth < 768 ? 280 : 650;
 
-        try {
-          const delta = Math.min(
-            clock.getDelta(),
-            0.05,
-          );
-
-          elapsed += delta;
-
-          if (!prefersReducedMotion) {
-            // Central AI core
-            centralSystem.group.rotation.y =
-              elapsed * 0.18;
-
-            centralSystem.group.rotation.x =
-              Math.sin(elapsed * 0.35) * 0.05;
-
-            const corePulse =
-              1 +
-              Math.sin(elapsed * 2.1) * 0.06;
-
-            centralSystem.core.scale.setScalar(
-              corePulse,
-            );
-
-            centralSystem.coreLight.intensity =
-              5 +
-              Math.sin(elapsed * 2.1) * 1.4;
-
-            // Agents
-            agents.forEach((agent, index) => {
-              const phase = agent.phase;
-
-              const float =
-                Math.sin(
-                  elapsed * 0.75 + phase,
-                ) * 0.28;
-
-              const secondaryFloat =
-                Math.sin(
-                  elapsed * 1.1 + phase * 1.7,
-                ) * 0.08;
-
-              agent.root.position.y =
-                agent.baseY + float;
-
-              agent.root.position.x +=
-                Math.sin(
-                  elapsed * 0.22 + phase,
-                ) * 0.0015;
-
-              agent.root.position.z =
-                Math.sin(
-                  elapsed * 0.28 + phase,
-                ) * agent.orbitRadius;
-
-              agent.root.rotation.y =
-                Math.sin(
-                  elapsed * 0.45 + phase,
-                ) * 0.12;
-
-              agent.root.rotation.z =
-                Math.sin(
-                  elapsed * 0.55 + phase,
-                ) * 0.025;
-
-              // Breathing
-              const breathing =
-                1 +
-                Math.sin(
-                  elapsed * 1.2 + phase,
-                ) * 0.018;
-
-              agent.body.scale.y =
-                breathing;
-
-              // Head movement
-              agent.head.rotation.y =
-                Math.sin(
-                  elapsed * 0.5 + phase,
-                ) * 0.12;
-
-              agent.head.rotation.x =
-                Math.sin(
-                  elapsed * 0.7 + phase,
-                ) * 0.04;
-
-              // Chest core pulse
-              const pulse =
-                1 +
-                Math.sin(
-                  elapsed * 2.5 + phase,
-                ) * 0.16;
-
-              agent.core.scale.setScalar(
-                pulse,
-              );
-
-              agent.coreLight.intensity =
-                1.8 +
-                Math.sin(
-                  elapsed * 2.5 + phase,
-                ) * 0.7;
-
-              // Orbit rings
-              agent.rings.rotation.z =
-                elapsed *
-                (index % 2 === 0
-                  ? 0.4
-                  : -0.35);
-
-              agent.rings.rotation.x =
-                Math.sin(
-                  elapsed * 0.35 + phase,
-                ) * 0.25;
-
-              // Agent particles
-              agent.particles.rotation.y =
-                elapsed * 0.12;
-
-              agent.particles.rotation.x =
-                elapsed * 0.06;
-
-              agent.root.position.y +=
-                secondaryFloat * 0.15;
-            });
-
-            // Connections
-            connectionGroup.rotation.y =
-              Math.sin(elapsed * 0.12) *
-              0.05;
-
-            connectionGroup.rotation.x =
-              Math.sin(elapsed * 0.09) *
-              0.025;
-
-            // Ambient particles
-            particleSystem.rotation.y =
-              elapsed * 0.025;
-
-            particleSystem.rotation.x =
-              Math.sin(elapsed * 0.06) *
-              0.05;
-
-            // Camera
-            camera.position.x =
-              Math.sin(elapsed * 0.08) *
-              0.18;
-
-            camera.position.y =
-              Math.cos(elapsed * 0.07) *
-              0.12;
-
-            camera.lookAt(0, 0, 0);
-          }
-
-          renderer.render(scene, camera);
-        } catch {
-          disposed = true;
-
-          if (frameId !== null) {
-            window.cancelAnimationFrame(
-              frameId,
-            );
-
-            frameId = null;
-          }
-        }
-      };
-
-      animate();
-
-      // ------------------------------------------------------------
-      // Resize
-      // ------------------------------------------------------------
-
-      const handleResize = () => {
-        if (
-          disposed ||
-          !renderer ||
-          !container
-        ) {
-          return;
-        }
-
-        try {
-          const nextWidth = Math.max(
-            container.clientWidth,
-            1,
-          );
-
-          const nextHeight = Math.max(
-            container.clientHeight,
-            1,
-          );
-
-          camera.aspect =
-            nextWidth / nextHeight;
-
-          camera.updateProjectionMatrix();
-
-          renderer.setSize(
-            nextWidth,
-            nextHeight,
-            false,
-          );
-
-          renderer.setPixelRatio(
-            Math.min(
-              window.devicePixelRatio || 1,
-              1.75,
-            ),
-          );
-        } catch {
-          // Decorative background only.
-        }
-      };
-
-      window.addEventListener(
-        "resize",
-        handleResize,
-        { passive: true },
+      const particlePositions = new Float32Array(
+        particleCount * 3
       );
+
+      const particleSizes = new Float32Array(particleCount);
+
+      for (let i = 0; i < particleCount; i += 1) {
+        const radius = 5 + Math.random() * 11;
+        const angle = Math.random() * Math.PI * 2;
+
+        particlePositions[i * 3] =
+          Math.cos(angle) * radius;
+
+        particlePositions[i * 3 + 1] =
+          -2.5 + Math.random() * 8;
+
+        particlePositions[i * 3 + 2] =
+          Math.sin(angle) * radius - 2;
+
+        particleSizes[i] =
+          0.015 + Math.random() * 0.035;
+      }
+
+      const particleGeometry = new THREE.BufferGeometry();
+
+      particleGeometry.setAttribute(
+        "position",
+        new THREE.BufferAttribute(particlePositions, 3)
+      );
+
+      particleGeometry.setAttribute(
+        "size",
+        new THREE.BufferAttribute(particleSizes, 1)
+      );
+
+      const particleMaterial = new THREE.PointsMaterial({
+        color: COLORS.cyan,
+        size: 0.045,
+        transparent: true,
+        opacity: 0.48,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        sizeAttenuation: true,
+      });
+
+      const particles = new THREE.Points(
+        particleGeometry,
+        particleMaterial
+      );
+
+      world.add(particles);
+
+      /*
+       * ------------------------------------------------------------
+       * RADIAL HUD RAYS
+       * ------------------------------------------------------------
+       */
+
+      const rayPositions: number[] = [];
+
+      for (let i = 0; i < 64; i += 1) {
+        const angle = (i / 64) * Math.PI * 2;
+
+        const inner = 3.9;
+        const outer = 7.5;
+
+        rayPositions.push(
+          Math.cos(angle) * inner,
+          -0.02,
+          Math.sin(angle) * inner
+        );
+
+        rayPositions.push(
+          Math.cos(angle) * outer,
+          -0.02,
+          Math.sin(angle) * outer
+        );
+      }
+
+      const rays = makeLineSegments(
+        rayPositions,
+        COLORS.blue,
+        0.08
+      );
+
+      world.add(rays);
+
+      /*
+       * ------------------------------------------------------------
+       * FLOOR LIGHT RINGS
+       * ------------------------------------------------------------
+       */
+
+      const floorRing = new THREE.Mesh(
+        new THREE.RingGeometry(4.6, 4.62, 128),
+        new THREE.MeshBasicMaterial({
+          color: COLORS.cyan,
+          transparent: true,
+          opacity: 0.22,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+        })
+      );
+
+      floorRing.rotation.x = Math.PI / 2;
+      floorRing.position.y = -3.27;
+
+      world.add(floorRing);
+
+      /*
+       * ------------------------------------------------------------
+       * ENVIRONMENT GRID
+       * ------------------------------------------------------------
+       */
+
+      const environmentGrid = createEnvironmentGrid();
+
+      environmentGrid.position.z = -2;
+      world.add(environmentGrid);
+
+      /*
+       * ------------------------------------------------------------
+       * RESPONSIVE CAMERA
+       * ------------------------------------------------------------
+       */
+
+      const updateSize = () => {
+        if (!renderer || !camera || !mount) {
+          return;
+        }
+
+        const width = Math.max(1, mount.clientWidth);
+        const height = Math.max(1, mount.clientHeight);
+
+        camera.aspect = width / height;
+
+        if (width < 480) {
+          camera.fov = 55;
+          camera.position.set(0, 1.7, 15.5);
+          world.scale.setScalar(0.78);
+          coreSystem.position.y = 1.2;
+          panelsGroup.visible = false;
+          environmentGrid.visible = false;
+          rays.visible = false;
+        } else if (width < 768) {
+          camera.fov = 52;
+          camera.position.set(0, 1.5, 14);
+          world.scale.setScalar(0.88);
+          coreSystem.position.y = 0.95;
+          panelsGroup.visible = false;
+          environmentGrid.visible = true;
+          rays.visible = true;
+        } else if (width < 1100) {
+          camera.fov = 49;
+          camera.position.set(0, 1.3, 13);
+          world.scale.setScalar(0.94);
+          coreSystem.position.y = 0.75;
+          panelsGroup.visible = true;
+          environmentGrid.visible = true;
+          rays.visible = true;
+        } else {
+          camera.fov = 47;
+          camera.position.set(0, 1.1, 12);
+          world.scale.setScalar(1);
+          coreSystem.position.y = 0.55;
+          panelsGroup.visible = true;
+          environmentGrid.visible = true;
+          rays.visible = true;
+        }
+
+        camera.updateProjectionMatrix();
+
+        renderer.setPixelRatio(
+          Math.min(
+            window.devicePixelRatio || 1,
+            width < 768 ? 1.25 : 1.65
+          )
+        );
+
+        renderer.setSize(width, height, false);
+      };
+
+      updateSize();
+
+      const resizeObserver = new ResizeObserver(updateSize);
+      resizeObserver.observe(mount);
+
+      cleanupCallbacks.push(() => {
+        resizeObserver.disconnect();
+      });
+
+      /*
+       * ------------------------------------------------------------
+       * MOUSE / POINTER PARALLAX
+       * ------------------------------------------------------------
+       */
+
+      let targetRotationX = 0;
+      let targetRotationY = 0;
+      let currentRotationX = 0;
+      let currentRotationY = 0;
+
+      const handlePointerMove = (event: PointerEvent) => {
+        if (window.innerWidth < 768) {
+          return;
+        }
+
+        const normalizedX =
+          event.clientX / window.innerWidth - 0.5;
+
+        const normalizedY =
+          event.clientY / window.innerHeight - 0.5;
+
+        targetRotationY = normalizedX * 0.12;
+        targetRotationX = normalizedY * 0.07;
+      };
+
+      window.addEventListener("pointermove", handlePointerMove, {
+        passive: true,
+      });
 
       cleanupCallbacks.push(() => {
         window.removeEventListener(
-          "resize",
-          handleResize,
+          "pointermove",
+          handlePointerMove
         );
       });
 
-      // ------------------------------------------------------------
-      // Cleanup
-      // ------------------------------------------------------------
+      /*
+       * ------------------------------------------------------------
+       * ANIMATION
+       * ------------------------------------------------------------
+       */
+
+      const clock = new THREE.Clock();
+
+      const prefersReducedMotion = window.matchMedia(
+        "(prefers-reduced-motion: reduce)"
+      ).matches;
+
+      const animate = () => {
+        if (destroyed) {
+          return;
+        }
+
+        animationFrame = window.requestAnimationFrame(animate);
+
+        if (contextLost || !renderer || !scene || !camera) {
+          return;
+        }
+
+        const elapsed = clock.getElapsedTime();
+
+        if (!prefersReducedMotion) {
+          /*
+           * Camera parallax.
+           */
+          currentRotationX +=
+            (targetRotationX - currentRotationX) * 0.025;
+
+          currentRotationY +=
+            (targetRotationY - currentRotationY) * 0.025;
+
+          world.rotation.x = currentRotationX;
+          world.rotation.y = currentRotationY;
+
+          /*
+           * Central AI reactor.
+           */
+          core.rotation.y += 0.0025;
+          core.rotation.x += 0.0012;
+
+          const coreChildren = core.children;
+
+          if (coreChildren[1]) {
+            coreChildren[1].rotation.y -= 0.004;
+            coreChildren[1].rotation.z += 0.0015;
+          }
+
+          if (coreChildren[2]) {
+            coreChildren[2].rotation.x += 0.003;
+            coreChildren[2].rotation.y += 0.002;
+          }
+
+          if (coreChildren[3]) {
+            const pulse =
+              1 + Math.sin(elapsed * 3.4) * 0.045;
+
+            coreChildren[3].scale.setScalar(pulse);
+          }
+
+          if (coreChildren[4]) {
+            const pulse =
+              1 + Math.sin(elapsed * 4.1) * 0.08;
+
+            coreChildren[4].scale.setScalar(pulse);
+          }
+
+          /*
+           * Energy rings.
+           */
+          for (
+            let index = 6;
+            index < core.children.length;
+            index += 1
+          ) {
+            const ring = core.children[index];
+
+            ring.rotation.x +=
+              index % 2 === 0 ? 0.0018 : -0.0013;
+
+            ring.rotation.y +=
+              index % 2 === 0 ? -0.0012 : 0.0018;
+          }
+
+          /*
+           * Radar.
+           */
+          radar.rotation.y += 0.0009;
+
+          /*
+           * Outer ring.
+           */
+          largeRing.rotation.z += 0.0007;
+
+          /*
+           * Scan arcs.
+           */
+          scanArcs.forEach((arc, index) => {
+            arc.rotation.z +=
+              index % 2 === 0 ? 0.003 : -0.002;
+
+            const material =
+              arc.material as THREE.MeshBasicMaterial;
+
+            material.opacity =
+              0.42 +
+              Math.sin(elapsed * 2 + index) * 0.18;
+          });
+
+          /*
+           * Vertical beam.
+           */
+          const beamMaterial =
+            beam.material as THREE.MeshBasicMaterial;
+
+          beamMaterial.opacity =
+            0.02 + Math.sin(elapsed * 2.4) * 0.008;
+
+          /*
+           * Agent nodes.
+           */
+          agents.forEach((agent, index) => {
+            const pulse =
+              1 +
+              Math.sin(
+                elapsed * 2.2 + agent.pulse
+              ) *
+                0.2;
+
+            agent.mesh.scale.setScalar(pulse);
+
+            agent.mesh.rotation.x +=
+              0.006 + index * 0.0005;
+
+            agent.mesh.rotation.y +=
+              0.009 + index * 0.0006;
+
+            const glowScale =
+              0.9 +
+              Math.sin(
+                elapsed * 2.2 + agent.pulse
+              ) *
+                0.16;
+
+            agent.glow.scale.setScalar(glowScale);
+
+            const material =
+              agent.mesh.material as THREE.MeshBasicMaterial;
+
+            material.opacity =
+              0.55 +
+              Math.sin(
+                elapsed * 2.2 + agent.pulse
+              ) *
+                0.25;
+          });
+
+          /*
+           * Data packets traveling through the network.
+           */
+          dataPackets.forEach((packet) => {
+            packet.progress += packet.speed;
+
+            if (packet.progress > 1) {
+              packet.progress = 0;
+            }
+
+            const point = new THREE.Vector3().lerpVectors(
+              packet.start,
+              packet.end,
+              packet.progress
+            );
+
+            const tail = new THREE.Vector3().lerpVectors(
+              packet.start,
+              packet.end,
+              Math.max(0, packet.progress - 0.025)
+            );
+
+            const positions = packet.line.geometry.getAttribute(
+              "position"
+            ) as THREE.BufferAttribute;
+
+            positions.setXYZ(
+              0,
+              tail.x,
+              tail.y,
+              tail.z
+            );
+
+            positions.setXYZ(
+              1,
+              point.x,
+              point.y,
+              point.z
+            );
+
+            positions.needsUpdate = true;
+          });
+
+          /*
+           * Floating data panels.
+           */
+          panels.forEach((panel, index) => {
+            const floatY =
+              Math.sin(
+                elapsed * 0.8 + panel.phase
+              ) * 0.08;
+
+            panel.group.position.y +=
+              (floatY -
+                (panel.group.userData.baseFloat ?? 0)) *
+              0.02;
+
+            panel.group.userData.baseFloat = floatY;
+
+            panel.group.rotation.z =
+              Math.sin(
+                elapsed * 0.35 + panel.phase
+              ) * 0.015;
+
+            const scalePulse =
+              1 +
+              Math.sin(
+                elapsed * 1.3 + index
+              ) *
+                0.008;
+
+            panel.group.scale.setScalar(
+              panel.group.userData.baseScale
+                ? panel.group.userData.baseScale *
+                    scalePulse
+                : scalePulse
+            );
+          });
+
+          /*
+           * Particles.
+           */
+          particles.rotation.y += 0.00035;
+          particles.rotation.x =
+            Math.sin(elapsed * 0.12) * 0.015;
+
+          /*
+           * Grid movement.
+           */
+          environmentGrid.position.z =
+            -2 + Math.sin(elapsed * 0.15) * 0.08;
+
+          /*
+           * Floor ring pulse.
+           */
+          const floorPulse =
+            1 +
+            Math.sin(elapsed * 1.8) * 0.015;
+
+          floorRing.scale.setScalar(floorPulse);
+        }
+
+        renderer.render(scene, camera);
+      };
+
+      panels.forEach((panel) => {
+        panel.group.userData.baseScale =
+          panel.group.scale.x;
+        panel.group.userData.baseFloat =
+          panel.group.position.y;
+      });
+
+      animate();
+
+      /*
+       * ------------------------------------------------------------
+       * CLEANUP
+       * ------------------------------------------------------------
+       */
 
       return () => {
-        disposed = true;
+        destroyed = true;
 
-        if (frameId !== null) {
-          window.cancelAnimationFrame(
-            frameId,
-          );
+        window.cancelAnimationFrame(animationFrame);
 
-          frameId = null;
-        }
-
-        cleanupCallbacks.forEach(
-          (callback) => {
-            try {
-              callback();
-            } catch {
-              // Ignore cleanup failures.
-            }
-          },
-        );
-
-        // Dispose every Three.js object.
-        disposeObject3D(scene);
-
-        if (renderer) {
-          try {
-            renderer.forceContextLoss();
-          } catch {
-            // Context may already be lost.
-          }
-
-          try {
-            renderer.dispose();
-          } catch {
-            // Renderer may already be disposed.
-          }
-
-          const canvas =
-            renderer.domElement;
-
-          if (
-            canvas.parentElement ===
-            container
-          ) {
-            try {
-              container.removeChild(
-                canvas,
-              );
-            } catch {
-              // Already removed.
-            }
-          }
-
-          renderer = null;
-        }
-      };
-    } catch {
-      // ------------------------------------------------------------
-      // Defensive setup failure handling
-      // ------------------------------------------------------------
-
-      disposed = true;
-
-      if (frameId !== null) {
-        window.cancelAnimationFrame(
-          frameId,
-        );
-
-        frameId = null;
-      }
-
-      cleanupCallbacks.forEach(
-        (callback) => {
+        cleanupCallbacks.forEach((callback) => {
           try {
             callback();
           } catch {
-            // Ignore.
+            // Defensive cleanup.
           }
-        },
-      );
+        });
 
-      if (renderer) {
         try {
-          renderer.forceContextLoss();
+          if (scene) {
+            disposeObject3D(scene);
+          }
         } catch {
-          // Context may already be lost.
+          // Defensive cleanup.
         }
 
         try {
-          renderer.dispose();
-        } catch {
-          // Renderer may already be disposed.
-        }
+          if (renderer) {
+            renderer.forceContextLoss();
+            renderer.dispose();
 
-        if (
-          renderer.domElement.parentElement ===
-          container
-        ) {
-          try {
-            container.removeChild(
-              renderer.domElement,
-            );
-          } catch {
-            // Already removed.
+            const rendererCanvas = renderer.domElement;
+
+            if (
+              rendererCanvas.parentElement === mount
+            ) {
+              mount.removeChild(rendererCanvas);
+            }
           }
+        } catch {
+          // Defensive cleanup.
         }
 
         renderer = null;
+        camera = null;
+        scene = null;
+      };
+    } catch (error) {
+      console.warn(
+        "PersonaAI 3D background could not initialize:",
+        error
+      );
+
+      destroyed = true;
+
+      window.cancelAnimationFrame(animationFrame);
+
+      cleanupCallbacks.forEach((callback) => {
+        try {
+          callback();
+        } catch {
+          // Defensive cleanup.
+        }
+      });
+
+      try {
+        if (scene) {
+          disposeObject3D(scene);
+        }
+      } catch {
+        // Defensive cleanup.
       }
 
-      // Never allow a decorative 3D scene
-      // to break authentication.
+      try {
+        if (renderer) {
+          renderer.forceContextLoss();
+          renderer.dispose();
+
+          const rendererCanvas = renderer.domElement;
+
+          if (
+            rendererCanvas.parentElement === mount
+          ) {
+            mount.removeChild(rendererCanvas);
+          }
+        }
+      } catch {
+        // Defensive cleanup.
+      }
+
+      renderer = null;
+      camera = null;
+      scene = null;
+
       return undefined;
     }
   }, []);
 
   return (
     <div
-      ref={containerRef}
+      ref={mountRef}
       aria-hidden="true"
-      className="pointer-events-none fixed inset-0 -z-10 overflow-hidden"
-      style={{
-        opacity: 0.78,
-        maskImage:
-          "radial-gradient(ellipse at center, black 32%, rgba(0,0,0,.92) 58%, transparent 88%)",
-        WebkitMaskImage:
-          "radial-gradient(ellipse at center, black 32%, rgba(0,0,0,.92) 58%, transparent 88%)",
-      }}
+      className="pointer-events-none fixed inset-0 z-0 overflow-hidden"
     >
+      {/* Soft atmospheric lighting behind the WebGL scene. */}
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_42%,rgba(76,125,255,0.10),transparent_28%),radial-gradient(circle_at_20%_60%,rgba(139,92,246,0.07),transparent_30%),radial-gradient(circle_at_80%_35%,rgba(53,217,255,0.06),transparent_28%)]" />
+
+      {/* Cinematic edge vignette. */}
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_center,transparent_38%,rgba(3,4,9,0.48)_100%)]" />
+
+      {/* Very subtle scan-line texture. */}
       <div
-        className="absolute inset-0"
+        className="pointer-events-none absolute inset-0 opacity-[0.035]"
         style={{
-          background:
-            "radial-gradient(circle at center, rgba(124,58,237,.07), transparent 38%), radial-gradient(circle at 50% 50%, rgba(37,99,235,.045), transparent 55%)",
+          backgroundImage:
+            "repeating-linear-gradient(to bottom, transparent 0px, transparent 3px, rgba(255,255,255,0.35) 4px)",
         }}
       />
     </div>
   );
-}
-
-/* ================================================================
-   AGENT
-   ================================================================ */
-
-function createAgent(
-  config: AgentConfig,
-): AgentRuntime {
-  const root = new THREE.Group();
-
-  root.position.copy(
-    config.position,
-  );
-
-  root.scale.setScalar(
-    config.scale,
-  );
-
-  const body =
-    new THREE.Group();
-
-  root.add(body);
-
-  // --------------------------------------------------------------
-  // Materials
-  // --------------------------------------------------------------
-
-  const bodyMaterial =
-    new THREE.MeshStandardMaterial({
-      color: 0x11131a,
-      metalness: 0.72,
-      roughness: 0.28,
-      transparent: true,
-      opacity: 0.94,
-    });
-
-  const darkMaterial =
-    new THREE.MeshStandardMaterial({
-      color: 0x08090d,
-      metalness: 0.82,
-      roughness: 0.22,
-    });
-
-  const glassMaterial =
-    new THREE.MeshPhysicalMaterial({
-      color: 0x1a1b25,
-      metalness: 0.15,
-      roughness: 0.18,
-      transmission: 0.18,
-      transparent: true,
-      opacity: 0.78,
-      clearcoat: 0.8,
-      clearcoatRoughness: 0.18,
-    });
-
-  const glowMaterial =
-    new THREE.MeshBasicMaterial({
-      color: config.color,
-      transparent: true,
-      opacity: 0.95,
-    });
-
-  // --------------------------------------------------------------
-  // Torso
-  // --------------------------------------------------------------
-
-  const torsoGeometry =
-    new THREE.SphereGeometry(
-      1,
-      20,
-      16,
-    );
-
-  torsoGeometry.scale(
-    0.92,
-    1.2,
-    0.55,
-  );
-
-  const torso =
-    new THREE.Mesh(
-      torsoGeometry,
-      bodyMaterial,
-    );
-
-  torso.position.y = -0.65;
-
-  body.add(torso);
-
-  // --------------------------------------------------------------
-  // Chest plate
-  // --------------------------------------------------------------
-
-  const chestGeometry =
-    new THREE.SphereGeometry(
-      0.65,
-      20,
-      12,
-    );
-
-  chestGeometry.scale(
-    0.85,
-    1.05,
-    0.28,
-  );
-
-  const chest =
-    new THREE.Mesh(
-      chestGeometry,
-      glassMaterial,
-    );
-
-  chest.position.set(
-    0,
-    -0.52,
-    0.38,
-  );
-
-  body.add(chest);
-
-  // --------------------------------------------------------------
-  // Chest AI core
-  // --------------------------------------------------------------
-
-  const coreGeometry =
-    new THREE.IcosahedronGeometry(
-      0.19,
-      1,
-    );
-
-  const core =
-    new THREE.Mesh(
-      coreGeometry,
-      glowMaterial,
-    );
-
-  core.position.set(
-    0,
-    -0.48,
-    0.72,
-  );
-
-  body.add(core);
-
-  const coreLight =
-    new THREE.PointLight(
-      config.color,
-      2.2,
-      3.5,
-      2,
-    );
-
-  coreLight.position.copy(
-    core.position,
-  );
-
-  body.add(coreLight);
-
-  // --------------------------------------------------------------
-  // Neck
-  // --------------------------------------------------------------
-
-  const neckGeometry =
-    new THREE.CylinderGeometry(
-      0.22,
-      0.25,
-      0.35,
-      12,
-    );
-
-  const neck =
-    new THREE.Mesh(
-      neckGeometry,
-      darkMaterial,
-    );
-
-  neck.position.y = 0.15;
-
-  body.add(neck);
-
-  // --------------------------------------------------------------
-  // Head
-  // --------------------------------------------------------------
-
-  const head =
-    new THREE.Group();
-
-  head.position.set(
-    0,
-    0.72,
-    0,
-  );
-
-  body.add(head);
-
-  const headGeometry =
-    new THREE.SphereGeometry(
-      0.62,
-      24,
-      20,
-    );
-
-  headGeometry.scale(
-    0.86,
-    1,
-    0.82,
-  );
-
-  const headMesh =
-    new THREE.Mesh(
-      headGeometry,
-      glassMaterial,
-    );
-
-  head.add(headMesh);
-
-  // --------------------------------------------------------------
-  // Face visor
-  // --------------------------------------------------------------
-
-  const visorGeometry =
-    new THREE.SphereGeometry(
-      0.38,
-      20,
-      12,
-      0,
-      Math.PI * 2,
-      0.25,
-      0.48,
-    );
-
-  visorGeometry.scale(
-    1.25,
-    0.55,
-    0.22,
-  );
-
-  const visorMaterial =
-    new THREE.MeshBasicMaterial({
-      color: 0x090a0f,
-      transparent: true,
-      opacity: 0.94,
-    });
-
-  const visor =
-    new THREE.Mesh(
-      visorGeometry,
-      visorMaterial,
-    );
-
-  visor.position.set(
-    0,
-    0.02,
-    0.52,
-  );
-
-  head.add(visor);
-
-  // --------------------------------------------------------------
-  // Eyes
-  // --------------------------------------------------------------
-
-  const eyeGeometry =
-    new THREE.SphereGeometry(
-      0.055,
-      10,
-      8,
-    );
-
-  const eyeMaterial =
-    new THREE.MeshBasicMaterial({
-      color: config.color,
-    });
-
-  const leftEye =
-    new THREE.Mesh(
-      eyeGeometry,
-      eyeMaterial,
-    );
-
-  const rightEye =
-    new THREE.Mesh(
-      eyeGeometry,
-      eyeMaterial,
-    );
-
-  leftEye.position.set(
-    -0.16,
-    0.05,
-    0.57,
-  );
-
-  rightEye.position.set(
-    0.16,
-    0.05,
-    0.57,
-  );
-
-  head.add(leftEye);
-  head.add(rightEye);
-
-  const eyeLight =
-    new THREE.PointLight(
-      config.color,
-      0.8,
-      1.8,
-      2,
-    );
-
-  eyeLight.position.set(
-    0,
-    0.05,
-    0.62,
-  );
-
-  head.add(eyeLight);
-
-  // --------------------------------------------------------------
-  // Crown
-  // --------------------------------------------------------------
-
-  const crownGeometry =
-    new THREE.TorusGeometry(
-      0.28,
-      0.025,
-      6,
-      24,
-    );
-
-  const crown =
-    new THREE.Mesh(
-      crownGeometry,
-      glowMaterial,
-    );
-
-  crown.rotation.x =
-    Math.PI / 2;
-
-  crown.position.y =
-    0.58;
-
-  head.add(crown);
-
-  // --------------------------------------------------------------
-  // Shoulders
-  // --------------------------------------------------------------
-
-  const shoulderGeometry =
-    new THREE.SphereGeometry(
-      0.4,
-      16,
-      12,
-    );
-
-  shoulderGeometry.scale(
-    1.35,
-    0.65,
-    0.72,
-  );
-
-  const leftShoulder =
-    new THREE.Mesh(
-      shoulderGeometry,
-      darkMaterial,
-    );
-
-  const rightShoulder =
-    new THREE.Mesh(
-      shoulderGeometry,
-      darkMaterial,
-    );
-
-  leftShoulder.position.set(
-    -0.78,
-    -0.38,
-    0,
-  );
-
-  rightShoulder.position.set(
-    0.78,
-    -0.38,
-    0,
-  );
-
-  body.add(leftShoulder);
-  body.add(rightShoulder);
-
-  // --------------------------------------------------------------
-  // Arms
-  // --------------------------------------------------------------
-
-  const armGeometry =
-    new THREE.CapsuleGeometry(
-      0.16,
-      0.72,
-      6,
-      12,
-    );
-
-  const leftArm =
-    new THREE.Mesh(
-      armGeometry,
-      bodyMaterial,
-    );
-
-  const rightArm =
-    new THREE.Mesh(
-      armGeometry,
-      bodyMaterial,
-    );
-
-  leftArm.position.set(
-    -0.98,
-    -0.9,
-    0,
-  );
-
-  rightArm.position.set(
-    0.98,
-    -0.9,
-    0,
-  );
-
-  leftArm.rotation.z =
-    -0.18;
-
-  rightArm.rotation.z =
-    0.18;
-
-  body.add(leftArm);
-  body.add(rightArm);
-
-  // --------------------------------------------------------------
-  // Hands
-  // --------------------------------------------------------------
-
-  const handGeometry =
-    new THREE.SphereGeometry(
-      0.19,
-      12,
-      10,
-    );
-
-  const leftHand =
-    new THREE.Mesh(
-      handGeometry,
-      glassMaterial,
-    );
-
-  const rightHand =
-    new THREE.Mesh(
-      handGeometry,
-      glassMaterial,
-    );
-
-  leftHand.position.set(
-    -1.06,
-    -1.35,
-    0,
-  );
-
-  rightHand.position.set(
-    1.06,
-    -1.35,
-    0,
-  );
-
-  body.add(leftHand);
-  body.add(rightHand);
-
-  // --------------------------------------------------------------
-  // Waist
-  // --------------------------------------------------------------
-
-  const waistGeometry =
-    new THREE.CylinderGeometry(
-      0.42,
-      0.52,
-      0.38,
-      16,
-    );
-
-  const waist =
-    new THREE.Mesh(
-      waistGeometry,
-      darkMaterial,
-    );
-
-  waist.position.y =
-    -1.55;
-
-  body.add(waist);
-
-  // --------------------------------------------------------------
-  // Legs
-  // --------------------------------------------------------------
-
-  const legGeometry =
-    new THREE.CapsuleGeometry(
-      0.22,
-      0.82,
-      6,
-      12,
-    );
-
-  const leftLeg =
-    new THREE.Mesh(
-      legGeometry,
-      bodyMaterial,
-    );
-
-  const rightLeg =
-    new THREE.Mesh(
-      legGeometry,
-      bodyMaterial,
-    );
-
-  leftLeg.position.set(
-    -0.32,
-    -2.12,
-    0,
-  );
-
-  rightLeg.position.set(
-    0.32,
-    -2.12,
-    0,
-  );
-
-  body.add(leftLeg);
-  body.add(rightLeg);
-
-  // --------------------------------------------------------------
-  // Feet
-  // --------------------------------------------------------------
-
-  const footGeometry =
-    new THREE.SphereGeometry(
-      0.28,
-      12,
-      8,
-    );
-
-  footGeometry.scale(
-    1.35,
-    0.45,
-    1.65,
-  );
-
-  const leftFoot =
-    new THREE.Mesh(
-      footGeometry,
-      darkMaterial,
-    );
-
-  const rightFoot =
-    new THREE.Mesh(
-      footGeometry,
-      darkMaterial,
-    );
-
-  leftFoot.position.set(
-    -0.32,
-    -2.78,
-    0.14,
-  );
-
-  rightFoot.position.set(
-    0.32,
-    -2.78,
-    0.14,
-  );
-
-  body.add(leftFoot);
-  body.add(rightFoot);
-
-  // --------------------------------------------------------------
-  // Platform
-  // --------------------------------------------------------------
-
-  const platformGeometry =
-    new THREE.CylinderGeometry(
-      1.25,
-      1.45,
-      0.12,
-      48,
-    );
-
-  const platformMaterial =
-    new THREE.MeshStandardMaterial({
-      color: 0x090a0f,
-      metalness: 0.85,
-      roughness: 0.24,
-      transparent: true,
-      opacity: 0.85,
-    });
-
-  const platform =
-    new THREE.Mesh(
-      platformGeometry,
-      platformMaterial,
-    );
-
-  platform.position.y =
-    -2.98;
-
-  root.add(platform);
-
-  // --------------------------------------------------------------
-  // Platform glow
-  // --------------------------------------------------------------
-
-  const platformRingGeometry =
-    new THREE.TorusGeometry(
-      1.05,
-      0.025,
-      6,
-      48,
-    );
-
-  const platformRing =
-    new THREE.Mesh(
-      platformRingGeometry,
-      glowMaterial,
-    );
-
-  platformRing.rotation.x =
-    Math.PI / 2;
-
-  platformRing.position.y =
-    -2.91;
-
-  root.add(platformRing);
-
-  // --------------------------------------------------------------
-  // Agent orbit rings
-  // --------------------------------------------------------------
-
-  const rings =
-    new THREE.Group();
-
-  const ringMaterial =
-    new THREE.MeshBasicMaterial({
-      color: config.color,
-      transparent: true,
-      opacity: 0.28,
-    });
-
-  const ring1 =
-    new THREE.Mesh(
-      new THREE.TorusGeometry(
-        1.55,
-        0.018,
-        6,
-        64,
-      ),
-      ringMaterial,
-    );
-
-  const ring2 =
-    new THREE.Mesh(
-      new THREE.TorusGeometry(
-        1.75,
-        0.012,
-        6,
-        64,
-      ),
-      ringMaterial,
-    );
-
-  ring1.rotation.x =
-    Math.PI / 2;
-
-  ring2.rotation.y =
-    Math.PI / 3;
-
-  ring2.rotation.x =
-    Math.PI / 2.8;
-
-  rings.add(ring1);
-  rings.add(ring2);
-
-  rings.position.y =
-    -0.55;
-
-  root.add(rings);
-
-  // --------------------------------------------------------------
-  // Agent particles
-  // --------------------------------------------------------------
-
-  const particleCount = 16;
-
-  const particlePositions =
-    new Float32Array(
-      particleCount * 3,
-    );
-
-  for (
-    let i = 0;
-    i < particleCount;
-    i++
-  ) {
-    const angle =
-      (i / particleCount) *
-      Math.PI *
-      2;
-
-    const radius =
-      1.5 +
-      Math.random() * 0.55;
-
-    particlePositions[i * 3] =
-      Math.cos(angle) * radius;
-
-    particlePositions[
-      i * 3 + 1
-    ] =
-      (Math.random() - 0.5) *
-      0.8;
-
-    particlePositions[
-      i * 3 + 2
-    ] =
-      Math.sin(angle) * radius;
-  }
-
-  const particleGeometry =
-    new THREE.BufferGeometry();
-
-  particleGeometry.setAttribute(
-    "position",
-    new THREE.BufferAttribute(
-      particlePositions,
-      3,
-    ),
-  );
-
-  const particleMaterial =
-    new THREE.PointsMaterial({
-      color: config.color,
-      size: 0.035,
-      transparent: true,
-      opacity: 0.65,
-      sizeAttenuation: true,
-    });
-
-  const particles =
-    new THREE.Points(
-      particleGeometry,
-      particleMaterial,
-    );
-
-  particles.position.y =
-    -0.55;
-
-  root.add(particles);
-
-  return {
-    root,
-    body,
-    head,
-    core,
-    coreLight,
-    rings,
-    particles,
-    baseY: config.position.y,
-    phase: config.phase,
-    orbitRadius: config.orbitRadius,
-  };
-}
-
-/* ================================================================
-   CENTRAL AI
-   ================================================================ */
-
-function createCentralAI() {
-  const group =
-    new THREE.Group();
-
-  // Main core
-  const coreGeometry =
-    new THREE.IcosahedronGeometry(
-      0.85,
-      2,
-    );
-
-  const coreMaterial =
-    new THREE.MeshPhysicalMaterial({
-      color: 0x7c3aed,
-      emissive: 0x5b21b6,
-      emissiveIntensity: 1.7,
-      metalness: 0.35,
-      roughness: 0.12,
-      transparent: true,
-      opacity: 0.92,
-      clearcoat: 1,
-      clearcoatRoughness: 0.08,
-    });
-
-  const core =
-    new THREE.Mesh(
-      coreGeometry,
-      coreMaterial,
-    );
-
-  group.add(core);
-
-  // Inner core
-  const innerGeometry =
-    new THREE.IcosahedronGeometry(
-      0.42,
-      1,
-    );
-
-  const innerMaterial =
-    new THREE.MeshBasicMaterial({
-      color: 0xa78bfa,
-      transparent: true,
-      opacity: 0.9,
-    });
-
-  const inner =
-    new THREE.Mesh(
-      innerGeometry,
-      innerMaterial,
-    );
-
-  group.add(inner);
-
-  // Outer rings
-  const ringMaterial =
-    new THREE.MeshBasicMaterial({
-      color: 0x8b5cf6,
-      transparent: true,
-      opacity: 0.28,
-    });
-
-  const ring1 =
-    new THREE.Mesh(
-      new THREE.TorusGeometry(
-        1.3,
-        0.025,
-        8,
-        72,
-      ),
-      ringMaterial,
-    );
-
-  const ring2 =
-    new THREE.Mesh(
-      new THREE.TorusGeometry(
-        1.65,
-        0.016,
-        8,
-        72,
-      ),
-      ringMaterial,
-    );
-
-  const ring3 =
-    new THREE.Mesh(
-      new THREE.TorusGeometry(
-        2,
-        0.009,
-        8,
-        72,
-      ),
-      ringMaterial,
-    );
-
-  ring1.rotation.x =
-    Math.PI / 2;
-
-  ring2.rotation.x =
-    Math.PI / 3;
-
-  ring3.rotation.x =
-    Math.PI / 2.4;
-
-  ring2.rotation.z =
-    Math.PI / 5;
-
-  ring3.rotation.y =
-    Math.PI / 4;
-
-  group.add(ring1);
-  group.add(ring2);
-  group.add(ring3);
-
-  // Core light
-  const coreLight =
-    new THREE.PointLight(
-      0x8b5cf6,
-      6,
-      8,
-      2,
-    );
-
-  group.add(coreLight);
-
-  return {
-    group,
-    core,
-    coreLight,
-  };
-}
-
-/* ================================================================
-   CONNECTIONS
-   ================================================================ */
-
-function createConnections() {
-  const group =
-    new THREE.Group();
-
-  const points = [
-    [-5.4, 2.2, 0.2],
-    [5.1, 2.6, -0.4],
-    [-5, -2.8, -0.2],
-    [5, -2.6, 0.4],
-  ];
-
-  const center = [0, 0, 0];
-
-  const positions: number[] = [];
-
-  // Agent -> central AI
-  for (const point of points) {
-    positions.push(
-      point[0],
-      point[1],
-      point[2],
-      center[0],
-      center[1],
-      center[2],
-    );
-  }
-
-  // Agent -> agent
-  const crossPairs = [
-    [0, 1],
-    [0, 2],
-    [1, 3],
-    [2, 3],
-  ];
-
-  for (const [a, b] of crossPairs) {
-    positions.push(
-      points[a][0],
-      points[a][1],
-      points[a][2],
-      points[b][0],
-      points[b][1],
-      points[b][2],
-    );
-  }
-
-  const geometry =
-    new THREE.BufferGeometry();
-
-  geometry.setAttribute(
-    "position",
-    new THREE.BufferAttribute(
-      new Float32Array(positions),
-      3,
-    ),
-  );
-
-  const material =
-    new THREE.LineBasicMaterial({
-      color: 0x6366f1,
-      transparent: true,
-      opacity: 0.09,
-    });
-
-  const lines =
-    new THREE.LineSegments(
-      geometry,
-      material,
-    );
-
-  group.add(lines);
-
-  // Data pulses
-  const pulsePositions =
-    new Float32Array(
-      12 * 3,
-    );
-
-  for (
-    let i = 0;
-    i < 12;
-    i++
-  ) {
-    pulsePositions[i * 3] =
-      (Math.random() - 0.5) * 9;
-
-    pulsePositions[
-      i * 3 + 1
-    ] =
-      (Math.random() - 0.5) * 6;
-
-    pulsePositions[
-      i * 3 + 2
-    ] =
-      (Math.random() - 0.5) * 2;
-  }
-
-  const pulseGeometry =
-    new THREE.BufferGeometry();
-
-  pulseGeometry.setAttribute(
-    "position",
-    new THREE.BufferAttribute(
-      pulsePositions,
-      3,
-    ),
-  );
-
-  const pulseMaterial =
-    new THREE.PointsMaterial({
-      color: 0xa78bfa,
-      size: 0.045,
-      transparent: true,
-      opacity: 0.75,
-    });
-
-  const pulses =
-    new THREE.Points(
-      pulseGeometry,
-      pulseMaterial,
-    );
-
-  group.add(pulses);
-
-  return group;
-}
-
-/* ================================================================
-   AMBIENT PARTICLES
-   ================================================================ */
-
-function createAmbientParticles() {
-  const count = 180;
-
-  const positions =
-    new Float32Array(
-      count * 3,
-    );
-
-  for (
-    let i = 0;
-    i < count;
-    i++
-  ) {
-    const radius =
-      5 +
-      Math.random() * 8;
-
-    const theta =
-      Math.random() *
-      Math.PI *
-      2;
-
-    const phi =
-      Math.acos(
-        2 * Math.random() - 1,
-      );
-
-    positions[i * 3] =
-      radius *
-      Math.sin(phi) *
-      Math.cos(theta);
-
-    positions[
-      i * 3 + 1
-    ] =
-      radius *
-      Math.sin(phi) *
-      Math.sin(theta);
-
-    positions[
-      i * 3 + 2
-    ] =
-      radius *
-      Math.cos(phi);
-  }
-
-  const geometry =
-    new THREE.BufferGeometry();
-
-  geometry.setAttribute(
-    "position",
-    new THREE.BufferAttribute(
-      positions,
-      3,
-    ),
-  );
-
-  const material =
-    new THREE.PointsMaterial({
-      color: 0x6366f1,
-      size: 0.035,
-      transparent: true,
-      opacity: 0.45,
-      sizeAttenuation: true,
-    });
-
-  return new THREE.Points(
-    geometry,
-    material,
-  );
-}
-
-/* ================================================================
-   ENVIRONMENT GRID
-   ================================================================ */
-
-function createEnvironmentGrid() {
-  const group =
-    new THREE.Group();
-
-  const gridMaterial =
-    new THREE.LineBasicMaterial({
-      color: 0x6366f1,
-      transparent: true,
-      opacity: 0.035,
-    });
-
-  const size = 24;
-  const divisions = 24;
-  const step =
-    size / divisions;
-
-  const positions: number[] = [];
-
-  for (
-    let i = 0;
-    i <= divisions;
-    i++
-  ) {
-    const p =
-      -size / 2 +
-      i * step;
-
-    positions.push(
-      -size / 2,
-      -3.05,
-      p,
-      size / 2,
-      -3.05,
-      p,
-    );
-
-    positions.push(
-      p,
-      -3.05,
-      -size / 2,
-      p,
-      -3.05,
-      size / 2,
-    );
-  }
-
-  const geometry =
-    new THREE.BufferGeometry();
-
-  geometry.setAttribute(
-    "position",
-    new THREE.BufferAttribute(
-      new Float32Array(positions),
-      3,
-    ),
-  );
-
-  const grid =
-    new THREE.LineSegments(
-      geometry,
-      gridMaterial,
-    );
-
-  grid.position.z = -2;
-
-  group.add(grid);
-
-  return group;
-}
-
-/* ================================================================
-   THREE.JS DISPOSAL
-   ================================================================ */
-
-function disposeObject3D(
-  object: THREE.Object3D,
-) {
-  object.traverse((child) => {
-    const mesh =
-      child as THREE.Mesh;
-
-    if (mesh.geometry) {
-      try {
-        mesh.geometry.dispose();
-      } catch {
-        // Ignore.
-      }
-    }
-
-    const material =
-      mesh.material;
-
-    if (Array.isArray(material)) {
-      material.forEach(
-        disposeMaterial,
-      );
-    } else if (material) {
-      disposeMaterial(material);
-    }
-  });
-}
-
-function disposeMaterial(
-  material: THREE.Material,
-) {
-  try {
-    material.dispose();
-  } catch {
-    // Ignore.
-  }
-}
-
-/* ================================================================
-   WEBGL DETECTION
-   ================================================================ */
-
-function isWebGLAvailable(): boolean {
-  try {
-    const canvas =
-      document.createElement(
-        "canvas",
-      );
-
-    const webgl2 =
-      canvas.getContext(
-        "webgl2",
-        {
-          failIfMajorPerformanceCaveat:
-            false,
-          antialias: false,
-        },
-      );
-
-    if (webgl2) {
-      return true;
-    }
-
-    const webgl =
-      canvas.getContext(
-        "webgl",
-        {
-          failIfMajorPerformanceCaveat:
-            false,
-          antialias: false,
-        },
-      );
-
-    return !!webgl;
-  } catch {
-    return false;
-  }
 }
