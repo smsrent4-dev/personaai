@@ -3,20 +3,20 @@
 Products are embedded (name + description + category + price folded
 into one string) exactly like knowledge chunks and memory entries, so
 ProductService.search() reuses the same cosine-similarity pattern
-(app/core/vector_math.py) as Knowledge/Memory search. This is what
-lets the Sales Agent "automatically retrieve product information"
-(per the original spec) without any hardcoded product-lookup logic -
-see MessagingPipeline._build_reply in app/services/messaging_pipeline.py.
+(app/core/vector_math.py) as Knowledge/Memory search.
+
+The Sales Agent can use Product.searchable_text() for semantic
+retrieval and primary_image_url() for sending the actual catalog
+image through channels such as WhatsApp.
 
 Currency defaults to the business/application billing currency rather
-than being hardcoded. This keeps product creation consistent with
-settings.DEFAULT_BILLING_CURRENCY (for example, NGN for Nigerian
-businesses).
+than being hardcoded.
 """
 
 import enum
 import uuid
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import JSON, Enum, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
@@ -136,9 +136,9 @@ class Product(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
         if self.variants:
             variant_names = ", ".join(
-                v.get("name", "")
+                str(v.get("name", "")).strip()
                 for v in self.variants
-                if v.get("name")
+                if isinstance(v, dict) and v.get("name")
             )
 
             if variant_names:
@@ -151,3 +151,83 @@ class Product(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         )
 
         return ". ".join(parts)
+
+    def primary_image_url(self) -> str | None:
+        """Return the first usable public product image URL.
+
+        Supports the common formats currently used by product
+        upload systems:
+
+        1. String URL:
+           ["https://example.com/image.jpg"]
+
+        2. Object with `url`:
+           [{"url": "https://example.com/image.jpg"}]
+
+        3. Cloudinary-style object with `secure_url`:
+           [{"secure_url": "https://res.cloudinary.com/..."}]
+
+        4. Object with `src`:
+           [{"src": "https://example.com/image.jpg"}]
+
+        Returns None when no usable image exists.
+        """
+
+        if not isinstance(self.images, list):
+            return None
+
+        for image in self.images:
+            if isinstance(image, str):
+                url = image.strip()
+
+                if url.startswith(("http://", "https://")):
+                    return url
+
+                continue
+
+            if isinstance(image, dict):
+                for key in ("secure_url", "url", "src"):
+                    value = image.get(key)
+
+                    if isinstance(value, str):
+                        url = value.strip()
+
+                        if url.startswith(("http://", "https://")):
+                            return url
+
+        return None
+
+    def has_image(self) -> bool:
+        """Return True when the product has a usable public image URL."""
+        return self.primary_image_url() is not None
+
+    def is_in_stock(self) -> bool:
+        """Return whether the product currently has available inventory.
+
+        A None inventory value is treated as unknown rather than
+        automatically out of stock.
+        """
+
+        if self.inventory is None:
+            return True
+
+        return self.inventory > 0
+
+    def available_variant_names(self) -> list[str]:
+        """Return the names of configured product variants."""
+
+        if not isinstance(self.variants, list):
+            return []
+
+        names: list[str] = []
+
+        for variant in self.variants:
+            if not isinstance(variant, dict):
+                continue
+
+            name = variant.get("name")
+
+            if isinstance(name, str) and name.strip():
+                names.append(name.strip())
+
+        return names
