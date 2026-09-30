@@ -1,37 +1,32 @@
-"""MessagingPipeline — production message orchestration.
+"""Production messaging orchestration pipeline.
 
-Flow for handle_incoming():
+Flow:
 
-  1. Parse the platform webhook payload.
-  2. Get/create the conversation.
-  3. Store the inbound message.
-  4. Mark the message as read / typing where supported.
-  5. Get/create the platform customer.
-  6. Apply human-assignment, auto-reply, business-hours and plan-limit rules.
-  7. IMAGE/VOICE messages are processed into useful text.
-  8. Select the appropriate agent.
-  9. Retrieve knowledge, memory and product context.
- 10. Build the conversation prompt without duplicating the current message.
- 11. Generate the AI response.
- 12. Store the outgoing message.
- 13. Send the response through the same platform.
- 14. Send a product image ONLY when the customer explicitly asks
-     to see/show/send a product image.
+1. Parse platform webhook payload.
+2. Get/create conversation.
+3. Store inbound message.
+4. Mark message as read / typing where supported.
+5. Get/create customer.
+6. Apply human takeover, auto-reply, business-hours and plan-limit rules.
+7. Process image / voice messages.
+8. Select the appropriate agent.
+9. Retrieve knowledge, memory and product context.
+10. Build the conversation prompt without duplicating the current message.
+11. Generate the AI response.
+12. Store the outgoing message.
+13. Send the text response.
+14. Send a product image ONLY when the customer explicitly requested one.
 
-Important production behavior:
+Important production rules:
 
-- Gemini/provider retries are handled by the AI provider.
-- This pipeline does NOT retry the entire message because doing so could
-  duplicate side effects such as orders, receipts or other tools.
-- Routing failure and response-generation failure are logged separately.
-- If AI routing fails, the pipeline falls back to an already-known/default
-  agent where possible instead of unnecessarily abandoning the conversation.
-- Payment receipt images are never treated as automatic payment confirmation.
-- Platform media downloads are normalized before being passed to the AI
-  provider because adapters may return `(bytes, mime_type)` tuples.
-- Explicit product-image requests are handled by application logic rather
-  than asking the LLM to physically send the image.
-- Normal product searches NEVER cause product images to be sent automatically.
+- Gemini/provider retries remain inside the AI provider.
+- This pipeline does not retry the entire inbound message.
+- Routing errors and generation errors are logged separately.
+- Routing failures fall back to a deterministic agent.
+- Payment receipt images are NOT treated as payment confirmation.
+- Platform media results are normalized before AI processing.
+- Product-image sending is controlled by application logic.
+- Normal product searches NEVER automatically send product images.
 """
 
 from __future__ import annotations
@@ -71,9 +66,9 @@ from app.services.tools import (
 logger = logging.getLogger(__name__)
 
 
-# ===========================================================================
+# ============================================================================
 # Order / payment constants
-# ===========================================================================
+# ============================================================================
 
 _AWAITING_PAYMENT_STATUSES = {
     PaymentStatus.UNPAID,
@@ -87,47 +82,30 @@ _CLOSED_ORDER_STATUSES = {
 }
 
 
-# ===========================================================================
+# ============================================================================
 # Product image intent
-# ===========================================================================
+# ============================================================================
 
-# IMPORTANT:
-#
-# This detector is ONLY for deciding whether the customer explicitly wants
-# a product image.
-#
-# It is NOT used to decide whether a product is relevant to the conversation.
-#
-# Normal product questions such as:
-#
-#   "How much is the hoodie?"
-#   "Do you have the black hoodie?"
-#   "Is the hoodie available?"
-#   "What sizes does the hoodie come in?"
-#   "Show me the price"
-#
-# must NOT cause an image to be sent.
-#
-# Explicit visual requests such as:
-#
-#   "Send me a picture of the hoodie"
-#   "Show me an image of the black hoodie"
-#   "Can I see the hoodie?"
-#   "What does the hoodie look like?"
-#
-# may cause an image to be sent.
+_PRODUCT_IMAGE_WORDS = (
+    "photo",
+    "picture",
+    "pic",
+    "image",
+    "images",
+    "photos",
+    "pictures",
+)
+
 _PRODUCT_IMAGE_INTENT_PATTERNS = (
-    # "send/show/share/get/view + image word"
-    r"\b(?:send|show|see|view|get|share)\b.{0,50}\b"
-    r"(?:photo|picture|pic|image|images|photos|pictures)\b",
+    # "send/show/share me a picture of..."
+    r"\b(?:send|show|see|view|get|share)\b"
+    r".{0,60}\b(?:photo|picture|pic|image|images|photos|pictures)\b",
 
-    # "image word + send/show/share/get/view"
+    # "picture/image ... send/show..."
     r"\b(?:photo|picture|pic|image|images|photos|pictures)\b"
-    r".{0,50}\b(?:send|show|see|view|get|share)\b",
+    r".{0,60}\b(?:send|show|see|view|get|share)\b",
 
     # "Can I see the hoodie?"
-    # This intentionally requires "see/view" to be followed by an actual
-    # object/context rather than matching every "can I see..." statement.
     r"\bcan\s+i\s+(?:see|view)\s+"
     r"(?:it|that|this|the\s+\w+|your\s+\w+|a\s+\w+|an\s+\w+)\b",
 
@@ -135,73 +113,37 @@ _PRODUCT_IMAGE_INTENT_PATTERNS = (
     r"\bcould\s+i\s+(?:see|view)\s+"
     r"(?:it|that|this|the\s+\w+|your\s+\w+|a\s+\w+|an\s+\w+)\b",
 
-    # "Let me see the hoodie"
+    # "Let me see the hoodie."
     r"\b(?:let|allow)\s+me\s+(?:see|view)\s+"
     r"(?:it|that|this|the\s+\w+|your\s+\w+|a\s+\w+|an\s+\w+)\b",
 
-    # "I want to see the hoodie"
+    # "I want to see the hoodie."
     r"\bi\s+(?:want|would\s+like|d['’]like)\s+to\s+(?:see|view)\s+"
     r"(?:it|that|this|the\s+\w+|your\s+\w+|a\s+\w+|an\s+\w+)\b",
 
     # "What does the hoodie look like?"
-    r"\bwhat\s+(?:does|do)\b.{0,60}\b"
-    r"(?:look\s+like|looks\s+like)\b",
+    r"\bwhat\s+(?:does|do)\b.{0,70}\blook\s+like\b",
 
     # "Can you show me the hoodie?"
-    r"\bcan\s+you\s+show\s+me\b.{0,50}\b"
+    r"\bcan\s+you\s+show\s+me\b.{0,60}\b"
     r"(?:the|this|that|your|a|an)\b",
 
     # "Could you show me the hoodie?"
-    r"\bcould\s+you\s+show\s+me\b.{0,50}\b"
+    r"\bcould\s+you\s+show\s+me\b.{0,60}\b"
     r"(?:the|this|that|your|a|an)\b",
 
-    # "Can you send the hoodie?"
-    #
-    # This pattern is deliberately NOT enough by itself to send an image
-    # unless the message also contains an image-related word.
-    r"\bcan\s+you\s+send\b.{0,40}\b"
+    # Explicit image request.
+    r"\bshow\s+me\b.{0,60}\b"
     r"(?:photo|picture|pic|image|images|photos|pictures)\b",
 
-    # Explicit "show me a photo/picture/image"
-    r"\bshow\s+me\b.{0,50}\b"
-    r"(?:photo|picture|pic|image|images|photos|pictures)\b",
-
-    # Explicit "show me what it looks like"
-    r"\bshow\s+me\b.{0,50}\b"
+    # "Show me what it looks like."
+    r"\bshow\s+me\b.{0,60}\b"
     r"(?:what\s+it\s+looks\s+like|what\s+that\s+looks\s+like)\b",
 )
 
 
 def _is_product_image_request(text: str | None) -> bool:
-    """Return True only when the customer explicitly requests a product image.
-
-    The function intentionally avoids broad patterns such as:
-
-        "show me"
-        "let me see"
-        "can you show"
-
-    by themselves because those phrases can also refer to prices, sizes,
-    colors, product details, availability, etc.
-
-    Examples that should return True:
-
-        "Send me a picture of the hoodie."
-        "Show me an image of the black hoodie."
-        "Can I see the hoodie?"
-        "Could I see the red sneakers?"
-        "What does the hoodie look like?"
-        "Show me a photo of the product."
-
-    Examples that should return False:
-
-        "How much is the hoodie?"
-        "Do you have a black hoodie?"
-        "Show me the price."
-        "Show me available sizes."
-        "Can you show me the price?"
-        "Is the hoodie available?"
-    """
+    """Return True only when the customer explicitly requests an image."""
 
     if not text:
         return False
@@ -213,37 +155,25 @@ def _is_product_image_request(text: str | None) -> bool:
     if not normalized:
         return False
 
-    for pattern in _PRODUCT_IMAGE_INTENT_PATTERNS:
-        if re.search(
+    return any(
+        re.search(
             pattern,
             normalized,
             flags=re.IGNORECASE,
-        ):
-            return True
-
-    return False
+        )
+        for pattern in _PRODUCT_IMAGE_INTENT_PATTERNS
+    )
 
 
 def _normalize_product_search_text(
     text: str | None,
 ) -> str:
-    """Remove image-request wording while preserving product wording.
-
-    Example:
-
-        "Can you send me a photo of the black hoodie?"
-
-    becomes approximately:
-
-        "black hoodie"
-
-    The cleaned text is used as an additional product-search query.
-    """
+    """Remove image-request wording while preserving product wording."""
 
     if not text:
         return ""
 
-    normalized = " ".join(
+    cleaned = " ".join(
         str(text).strip().lower().split()
     )
 
@@ -286,8 +216,6 @@ def _normalize_product_search_text(
         r"\blook\s+like\b",
     )
 
-    cleaned = normalized
-
     for pattern in replacements:
         cleaned = re.sub(
             pattern,
@@ -296,17 +224,17 @@ def _normalize_product_search_text(
             flags=re.IGNORECASE,
         )
 
-    cleaned = re.sub(
+    return re.sub(
         r"\s+",
         " ",
         cleaned,
     ).strip()
 
-    return cleaned
 
-
-def _product_has_image(product: Product | None) -> bool:
-    """Return True when a product has at least one usable image URL."""
+def _product_has_image(
+    product: Product | None,
+) -> bool:
+    """Return True when a product contains a usable image URL."""
 
     if product is None:
         return False
@@ -326,27 +254,28 @@ def _product_has_image(product: Product | None) -> bool:
 def _build_product_photo_caption(
     product: Product,
 ) -> str:
-    """Build a useful caption for a product image."""
+    """Build a concise product image caption."""
 
     lines = [
-        f"{product.name} — {product.price} {product.currency}"
+        f"{product.name} — {product.price} {product.currency}",
     ]
 
     variants = product.variants or []
 
-    variant_names = [
-        variant.get("name")
-        for variant in variants
-        if (
-            isinstance(variant, dict)
-            and variant.get("name")
-        )
-    ]
+    if isinstance(variants, list):
+        variant_names = [
+            variant.get("name")
+            for variant in variants
+            if (
+                isinstance(variant, dict)
+                and variant.get("name")
+            )
+        ]
 
-    if variant_names:
-        lines.append(
-            f"Available: {', '.join(variant_names)}"
-        )
+        if variant_names:
+            lines.append(
+                f"Available: {', '.join(variant_names)}"
+            )
 
     if product.inventory is not None:
         if product.inventory > 0:
@@ -356,15 +285,15 @@ def _build_product_photo_caption(
 
     if product.description:
         lines.append(
-            product.description[:200]
+            str(product.description)[:200]
         )
 
     return "\n".join(lines)[:1024]
 
 
-# ===========================================================================
+# ============================================================================
 # Non-text fallbacks
-# ===========================================================================
+# ============================================================================
 
 _NON_TEXT_ACKNOWLEDGEMENTS = {
     MessageType.IMAGE: (
@@ -391,11 +320,11 @@ _NON_TEXT_ACKNOWLEDGEMENTS = {
 }
 
 
-# ===========================================================================
+# ============================================================================
 # Business hours
-# ===========================================================================
+# ============================================================================
 
-_WEEKDAY_KEYS = [
+_WEEKDAY_KEYS = (
     "mon",
     "tue",
     "wed",
@@ -403,13 +332,13 @@ _WEEKDAY_KEYS = [
     "fri",
     "sat",
     "sun",
-]
+)
 
 
 def _after_hours_reply(
     settings: dict,
 ) -> str | None:
-    """Return an after-hours message when business hours are configured."""
+    """Return an after-hours response when business hours are configured."""
 
     business_hours = settings.get(
         "business_hours"
@@ -421,17 +350,17 @@ def _after_hours_reply(
     ):
         return None
 
-    if not business_hours.get(
-        "enabled"
-    ):
+    if not business_hours.get("enabled"):
         return None
 
     try:
         import zoneinfo
 
-        timezone_name = business_hours.get(
-            "timezone",
-            "UTC",
+        timezone_name = str(
+            business_hours.get(
+                "timezone",
+                "UTC",
+            )
         )
 
         timezone = zoneinfo.ZoneInfo(
@@ -449,23 +378,24 @@ def _after_hours_reply(
             {},
         )
 
+        if not isinstance(hours, dict):
+            return None
+
         window = hours.get(
             today_key
         )
 
         if not window or len(window) < 2:
             is_open = False
-        else:
-            open_str = str(window[0])
-            close_str = str(window[1])
 
+        else:
             open_time = datetime.strptime(
-                open_str,
+                str(window[0]),
                 "%H:%M",
             ).time()
 
             close_time = datetime.strptime(
-                close_str,
+                str(window[1]),
                 "%H:%M",
             ).time()
 
@@ -477,8 +407,8 @@ def _after_hours_reply(
                     <= current_time
                     <= close_time
                 )
-
             else:
+                # Overnight schedule, e.g. 22:00 -> 06:00.
                 is_open = (
                     current_time >= open_time
                     or current_time <= close_time
@@ -486,37 +416,47 @@ def _after_hours_reply(
 
     except Exception:
         logger.warning(
-            (
-                "Malformed business_hours settings; "
-                "ignoring business-hours rule"
-            ),
+            "Malformed business_hours settings; ignoring rule",
             exc_info=True,
         )
-
         return None
 
     if is_open:
         return None
 
-    return business_hours.get(
-        "message",
-        (
-            "Thanks for reaching out! We're currently outside business "
-            "hours and will reply as soon as we're back."
-        ),
+    message = business_hours.get(
+        "message"
+    )
+
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+
+    return (
+        "Thanks for reaching out! We're currently outside business "
+        "hours and will reply as soon as we're back."
     )
 
 
-# ===========================================================================
+# ============================================================================
 # Media normalization
-# ===========================================================================
-
+# ============================================================================
 
 def _normalize_downloaded_media(
     media_result: Any,
     default_mime_type: str,
 ) -> tuple[bytes, str]:
-    """Normalize platform media into `(bytes, mime_type)`."""
+    """Normalize adapter media into `(bytes, mime_type)`.
+
+    Adapters may return:
+
+        bytes
+        bytearray
+        memoryview
+        (bytes, mime_type)
+        [bytes, mime_type]
+        response-like objects with `.content`
+        objects with `.content` and `.mime_type`
+    """
 
     if media_result is None:
         raise ValueError(
@@ -573,10 +513,10 @@ def _normalize_downloaded_media(
                 item,
                 str,
             ):
-                possible_mime = item.strip()
+                value = item.strip()
 
-                if "/" in possible_mime:
-                    mime_type = possible_mime
+                if "/" in value:
+                    mime_type = value
 
     else:
         possible_bytes = getattr(
@@ -615,9 +555,7 @@ def _normalize_downloaded_media(
             possible_mime,
             str,
         ):
-            possible_mime = (
-                possible_mime.strip()
-            )
+            possible_mime = possible_mime.strip()
 
             if possible_mime:
                 mime_type = possible_mime
@@ -628,24 +566,18 @@ def _normalize_downloaded_media(
             f"from type {type(media_result).__name__}"
         )
 
-    final_mime_type = (
-        mime_type
-        or default_mime_type
-    )
-
     return (
         media_bytes,
-        final_mime_type,
+        mime_type or default_mime_type,
     )
 
 
-# ===========================================================================
+# ============================================================================
 # MessagingPipeline
-# ===========================================================================
-
+# ============================================================================
 
 class MessagingPipeline:
-    """Orchestrates inbound platform messages."""
+    """Production inbound messaging orchestration."""
 
     def __init__(
         self,
@@ -653,37 +585,37 @@ class MessagingPipeline:
     ):
         self.db = db
 
-        self.conversation_service = (
-            ConversationService(db)
+        self.conversation_service = ConversationService(
+            db
         )
 
-        self.router_service = (
-            RouterService(db)
+        self.router_service = RouterService(
+            db
         )
 
-        self.knowledge_service = (
-            KnowledgeService(db)
+        self.knowledge_service = KnowledgeService(
+            db
         )
 
-        self.memory_service = (
-            MemoryService(db)
+        self.memory_service = MemoryService(
+            db
         )
 
-        self.product_service = (
-            ProductService(db)
+        self.product_service = ProductService(
+            db
         )
 
-        self.customer_service = (
-            CustomerService(db)
+        self.customer_service = CustomerService(
+            db
         )
 
-        self.order_service = (
-            OrderService(db)
+        self.order_service = OrderService(
+            db
         )
 
-    # =======================================================================
+    # ========================================================================
     # Main entry point
-    # =======================================================================
+    # ========================================================================
 
     async def handle_incoming(
         self,
@@ -691,7 +623,7 @@ class MessagingPipeline:
         integration: PlatformIntegration,
         raw_payload: dict,
     ) -> None:
-        """Process one incoming platform webhook/message."""
+        """Process one incoming platform webhook message."""
 
         adapter = build_adapter(
             integration
@@ -699,7 +631,7 @@ class MessagingPipeline:
 
         try:
             # ----------------------------------------------------------------
-            # 1. Parse incoming platform payload
+            # 1. Parse webhook
             # ----------------------------------------------------------------
 
             incoming = adapter.parse_incoming(
@@ -708,20 +640,15 @@ class MessagingPipeline:
 
             if incoming is None:
                 logger.debug(
-                    (
-                        "Platform adapter ignored incoming payload "
-                        "for integration %s"
-                    ),
+                    "Platform adapter ignored payload for integration %s",
                     integration.id,
                 )
-
                 return
 
             logger.info(
                 (
-                    "Processing incoming message: platform=%s "
-                    "conversation=%s message_type=%s "
-                    "external_message_id=%s"
+                    "Processing incoming message: "
+                    "platform=%s conversation=%s type=%s external_id=%s"
                 ),
                 integration.platform,
                 incoming.external_conversation_id,
@@ -776,7 +703,7 @@ class MessagingPipeline:
             await self.db.commit()
 
             # ----------------------------------------------------------------
-            # 4. Mark message as read / typing
+            # 4. Mark read / typing
             # ----------------------------------------------------------------
 
             if (
@@ -794,12 +721,9 @@ class MessagingPipeline:
                             True,
                         ),
                     )
-
                 except Exception:
                     logger.debug(
-                        (
-                            "mark_read failed for message %s"
-                        ),
+                        "mark_read failed for message %s",
                         incoming.external_message_id,
                         exc_info=True,
                     )
@@ -827,7 +751,7 @@ class MessagingPipeline:
                 await self.db.commit()
 
             # ----------------------------------------------------------------
-            # 6. Human takeover / auto-reply
+            # 6. Human takeover
             # ----------------------------------------------------------------
 
             if conversation.assigned_to_human:
@@ -838,8 +762,11 @@ class MessagingPipeline:
                     ),
                     conversation.id,
                 )
-
                 return
+
+            # ----------------------------------------------------------------
+            # 7. Auto-reply setting
+            # ----------------------------------------------------------------
 
             if not integration.settings.get(
                 "auto_reply",
@@ -852,18 +779,17 @@ class MessagingPipeline:
                     ),
                     integration.id,
                 )
-
                 return
 
             # ----------------------------------------------------------------
-            # 7. Business-hours rule
+            # 8. Business hours
             # ----------------------------------------------------------------
 
             after_hours_reply = _after_hours_reply(
                 integration.settings
             )
 
-            if after_hours_reply is not None:
+            if after_hours_reply:
                 await self.conversation_service.add_message(
                     conversation,
                     role=MessageRole.SYSTEM,
@@ -877,7 +803,6 @@ class MessagingPipeline:
                         incoming.external_conversation_id,
                         after_hours_reply,
                     )
-
                 except Exception:
                     logger.warning(
                         (
@@ -891,7 +816,7 @@ class MessagingPipeline:
                 return
 
             # ----------------------------------------------------------------
-            # 8. Plan message limit
+            # 9. Plan limit
             # ----------------------------------------------------------------
 
             limit_reached, plan = (
@@ -909,22 +834,16 @@ class MessagingPipeline:
                     adapter=adapter,
                     plan=plan,
                 )
-
                 return
 
             # ----------------------------------------------------------------
-            # 9. Convert image / voice into useful text
+            # 10. Process media
             # ----------------------------------------------------------------
 
             effective_text = incoming.text
 
-            # ----------------------------------------------------------------
-            # IMAGE
-            # ----------------------------------------------------------------
-
             if (
-                incoming.message_type
-                == MessageType.IMAGE
+                incoming.message_type == MessageType.IMAGE
                 and incoming.media_file_id
             ):
                 handled, effective_text = (
@@ -941,13 +860,8 @@ class MessagingPipeline:
                 if handled:
                     return
 
-            # ----------------------------------------------------------------
-            # VOICE
-            # ----------------------------------------------------------------
-
             elif (
-                incoming.message_type
-                == MessageType.VOICE
+                incoming.message_type == MessageType.VOICE
                 and incoming.media_file_id
             ):
                 effective_text = (
@@ -978,12 +892,11 @@ class MessagingPipeline:
                             incoming.external_conversation_id,
                             fallback_message,
                         )
-
                     except Exception:
                         logger.warning(
                             (
-                                "Failed to send voice transcription "
-                                "fallback for conversation %s"
+                                "Failed to send voice fallback "
+                                "for conversation %s"
                             ),
                             conversation.id,
                             exc_info=True,
@@ -992,16 +905,7 @@ class MessagingPipeline:
                     return
 
             # ----------------------------------------------------------------
-            # Detect explicit product image request.
-            #
-            # IMPORTANT:
-            #
-            # This is application-level intent detection.
-            #
-            # The LLM does NOT physically send the image.
-            #
-            # The backend sends the image through the platform adapter only
-            # after the AI text response has been successfully sent.
+            # 11. Detect explicit product image request
             # ----------------------------------------------------------------
 
             wants_product_image = (
@@ -1013,21 +917,21 @@ class MessagingPipeline:
             if wants_product_image:
                 logger.info(
                     (
-                        "Explicit product image request detected "
-                        "for conversation %s: %s"
+                        "Explicit product image request detected: "
+                        "conversation=%s text=%s"
                     ),
                     conversation.id,
                     effective_text,
                 )
 
             # ----------------------------------------------------------------
-            # 10. Select agent
+            # 12. Select agent
             # ----------------------------------------------------------------
 
             agent = None
 
-            if effective_text:
-                try:
+            try:
+                if effective_text:
                     logger.info(
                         "Routing message for conversation %s",
                         conversation.id,
@@ -1051,38 +955,25 @@ class MessagingPipeline:
                         conversation.id,
                     )
 
-                except Exception:
-                    logger.error(
-                        (
-                            "AI routing failed for conversation %s; "
-                            "falling back to deterministic agent"
-                        ),
-                        conversation.id,
-                        exc_info=True,
+                else:
+                    agent = (
+                        await self._pick_agent_without_ai(
+                            owner.id,
+                            conversation,
+                            integration,
+                        )
                     )
 
-                    try:
-                        agent = (
-                            await self._pick_agent_without_ai(
-                                owner.id,
-                                conversation,
-                                integration,
-                            )
-                        )
+            except Exception:
+                logger.error(
+                    (
+                        "AI routing failed for conversation %s; "
+                        "using deterministic fallback"
+                    ),
+                    conversation.id,
+                    exc_info=True,
+                )
 
-                    except Exception:
-                        logger.error(
-                            (
-                                "Deterministic agent fallback also failed "
-                                "for conversation %s"
-                            ),
-                            conversation.id,
-                            exc_info=True,
-                        )
-
-                        agent = None
-
-            else:
                 try:
                     agent = (
                         await self._pick_agent_without_ai(
@@ -1095,7 +986,7 @@ class MessagingPipeline:
                 except Exception:
                     logger.error(
                         (
-                            "Unable to select an agent "
+                            "Deterministic agent selection failed "
                             "for conversation %s"
                         ),
                         conversation.id,
@@ -1105,7 +996,28 @@ class MessagingPipeline:
                     agent = None
 
             # ----------------------------------------------------------------
-            # 11. Generate response + product context
+            # Persist selected agent when available.
+            # ----------------------------------------------------------------
+
+            if agent is not None:
+                try:
+                    if conversation.agent_id != agent.id:
+                        conversation.agent_id = agent.id
+                        await self.db.commit()
+                except Exception:
+                    await self.db.rollback()
+
+                    logger.warning(
+                        (
+                            "Could not persist agent assignment for "
+                            "conversation %s"
+                        ),
+                        conversation.id,
+                        exc_info=True,
+                    )
+
+            # ----------------------------------------------------------------
+            # 13. Generate AI response
             # ----------------------------------------------------------------
 
             if agent is None:
@@ -1114,15 +1026,14 @@ class MessagingPipeline:
                     "A team member will follow up shortly."
                 )
 
-                top_product = None
                 requested_product = None
 
             else:
                 try:
                     logger.info(
                         (
-                            "Generating AI reply: conversation=%s "
-                            "agent=%s message_type=%s"
+                            "Generating AI reply: "
+                            "conversation=%s agent=%s type=%s"
                         ),
                         conversation.id,
                         agent.id,
@@ -1131,7 +1042,7 @@ class MessagingPipeline:
 
                     (
                         reply_text,
-                        top_product,
+                        _top_product,
                         requested_product,
                     ) = await self._build_reply(
                         owner=owner,
@@ -1164,8 +1075,8 @@ class MessagingPipeline:
                 except Exception:
                     logger.error(
                         (
-                            "AI reply generation failed for conversation %s "
-                            "using agent %s"
+                            "AI reply generation failed for "
+                            "conversation %s using agent %s"
                         ),
                         conversation.id,
                         agent.id,
@@ -1177,11 +1088,10 @@ class MessagingPipeline:
                         "We'll follow up shortly."
                     )
 
-                    top_product = None
                     requested_product = None
 
             # ----------------------------------------------------------------
-            # 12. Store outgoing message
+            # 14. Store outgoing message
             # ----------------------------------------------------------------
 
             await self.conversation_service.add_message(
@@ -1198,7 +1108,7 @@ class MessagingPipeline:
             await self.db.commit()
 
             # ----------------------------------------------------------------
-            # 13. Send final text response
+            # 15. Send text
             # ----------------------------------------------------------------
 
             try:
@@ -1206,7 +1116,6 @@ class MessagingPipeline:
                     incoming.external_conversation_id,
                     reply_text,
                 )
-
             except Exception:
                 logger.error(
                     (
@@ -1217,42 +1126,11 @@ class MessagingPipeline:
                     exc_info=True,
                 )
 
-                # Do not regenerate or retry the entire pipeline.
+                # Do not retry the entire pipeline.
                 return
 
             # ----------------------------------------------------------------
-            # 14. Send product image ONLY when explicitly requested
-            # ----------------------------------------------------------------
-            #
-            # IMPORTANT PRODUCTION RULE:
-            #
-            # top_product is useful for AI/product context.
-            #
-            # It MUST NOT be used as a reason to send an image.
-            #
-            # Therefore:
-            #
-            #     wants_product_image
-            #             AND
-            #     requested_product exists
-            #             AND
-            #     requested_product has an image
-            #
-            # are ALL required.
-            #
-            # This prevents:
-            #
-            # "How much is the hoodie?"
-            #
-            # from sending:
-            #
-            # "hoodie.jpg"
-            #
-            # while still allowing:
-            #
-            # "Send me a picture of the hoodie."
-            #
-            # to send the image.
+            # 16. Send product image only when explicitly requested
             # ----------------------------------------------------------------
 
             if (
@@ -1263,9 +1141,9 @@ class MessagingPipeline:
                 )
             ):
                 try:
-                    image_url = (
+                    image_url = str(
                         requested_product.images[0]
-                    )
+                    ).strip()
 
                     caption = (
                         _build_product_photo_caption(
@@ -1275,12 +1153,11 @@ class MessagingPipeline:
 
                     logger.info(
                         (
-                            "Sending explicitly requested product image: "
-                            "conversation=%s product=%s image_url=%s"
+                            "Sending requested product image: "
+                            "conversation=%s product=%s"
                         ),
                         conversation.id,
                         requested_product.id,
-                        image_url,
                     )
 
                     await adapter.send_photo(
@@ -1301,7 +1178,7 @@ class MessagingPipeline:
                 except Exception:
                     logger.warning(
                         (
-                            "Failed to send requested product photo "
+                            "Failed to send requested product image "
                             "for product %s"
                         ),
                         requested_product.id,
@@ -1312,8 +1189,8 @@ class MessagingPipeline:
                 logger.info(
                     (
                         "Customer explicitly requested a product image, "
-                        "but no matching product with a usable image "
-                        "was found: conversation=%s"
+                        "but no matching product image was available: "
+                        "conversation=%s"
                     ),
                     conversation.id,
                 )
@@ -1348,16 +1225,15 @@ class MessagingPipeline:
             if aclose is not None:
                 try:
                     await aclose()
-
                 except Exception:
                     logger.debug(
                         "Platform adapter close failed",
                         exc_info=True,
                     )
 
-    # =======================================================================
+    # ========================================================================
     # Plan limit
-    # =======================================================================
+    # ========================================================================
 
     async def _handle_message_limit_reached(
         self,
@@ -1367,7 +1243,7 @@ class MessagingPipeline:
         adapter: Any,
         plan: Any,
     ) -> None:
-        """Send a plan-limit response and notify owner once per 24 hours."""
+        """Send plan-limit response and notify the owner once per 24 hours."""
 
         reply = (
             "Thanks for your message! We've reached our messaging limit "
@@ -1388,7 +1264,6 @@ class MessagingPipeline:
                 conversation.external_conversation_id,
                 reply,
             )
-
         except Exception:
             logger.warning(
                 (
@@ -1405,7 +1280,7 @@ class MessagingPipeline:
                 - timedelta(hours=24)
             )
 
-            existing_notification = await self.db.scalar(
+            result = await self.db.execute(
                 select(Notification)
                 .where(
                     Notification.owner_id == owner.id,
@@ -1418,11 +1293,13 @@ class MessagingPipeline:
                 )
             )
 
+            existing_notification = (
+                result.scalars().first()
+            )
+
             if existing_notification is None:
-                notification_service = (
-                    NotificationService(
-                        self.db
-                    )
+                notification_service = NotificationService(
+                    self.db
                 )
 
                 await notification_service.create_notification(
@@ -1449,16 +1326,16 @@ class MessagingPipeline:
                 exc_info=True,
             )
 
-    # =======================================================================
+    # ========================================================================
     # Receipt order lookup
-    # =======================================================================
+    # ========================================================================
 
     async def _find_receipt_target_order(
         self,
         owner_id,
         customer_id,
     ):
-        """Find newest customer order awaiting payment."""
+        """Find the newest customer order awaiting payment."""
 
         orders = await self.order_service.list_orders(
             owner_id,
@@ -1469,24 +1346,21 @@ class MessagingPipeline:
             if order.status in _CLOSED_ORDER_STATUSES:
                 continue
 
-            if (
-                order.payment_status
-                in _AWAITING_PAYMENT_STATUSES
-            ):
+            if order.payment_status in _AWAITING_PAYMENT_STATUSES:
                 return order
 
         return None
 
-    # =======================================================================
-    # Media MIME helpers
-    # =======================================================================
+    # ========================================================================
+    # MIME helpers
+    # ========================================================================
 
     @staticmethod
     def _get_media_mime_type(
         incoming,
         default: str,
     ) -> str:
-        """Get MIME type from platform metadata."""
+        """Read MIME type from incoming platform metadata."""
 
         metadata = getattr(
             incoming,
@@ -1511,18 +1385,16 @@ class MessagingPipeline:
             mime_type,
             str,
         ):
-            mime_type = (
-                mime_type.strip().lower()
-            )
+            mime_type = mime_type.strip().lower()
 
             if mime_type:
                 return mime_type
 
         return default
 
-    # =======================================================================
-    # Image handling
-    # =======================================================================
+    # ========================================================================
+    # Image processing
+    # ========================================================================
 
     async def _handle_image_message(
         self,
@@ -1533,7 +1405,7 @@ class MessagingPipeline:
         adapter,
         inbound_message: Message,
     ) -> tuple[bool, str | None]:
-        """Download and understand an incoming image."""
+        """Download and analyze an incoming image."""
 
         if not incoming.media_file_id:
             return (
@@ -1556,14 +1428,19 @@ class MessagingPipeline:
             image_data, mime_type = (
                 _normalize_downloaded_media(
                     media_result,
-                    default_mime_type="image/jpeg",
+                    default_mime_type=(
+                        self._get_media_mime_type(
+                            incoming,
+                            "image/jpeg",
+                        )
+                    ),
                 )
             )
 
             logger.info(
                 (
                     "Analyzing image for conversation %s "
-                    "with mime_type=%s"
+                    "mime_type=%s"
                 ),
                 conversation.id,
                 mime_type,
@@ -1582,7 +1459,7 @@ class MessagingPipeline:
 
             if not description:
                 raise ValueError(
-                    "Image analysis returned empty description"
+                    "Image analysis returned an empty description"
                 )
 
             effective_text = (
@@ -1604,14 +1481,11 @@ class MessagingPipeline:
 
             await self.db.commit()
 
-            # ---------------------------------------------------------------
-            # Payment receipt detection.
+            # ----------------------------------------------------------------
+            # Payment receipt classification
             #
-            # IMPORTANT:
-            #
-            # Classification alone does NOT confirm payment.
-            # The actual payment still needs verification.
-            # ---------------------------------------------------------------
+            # Classification NEVER confirms payment.
+            # ----------------------------------------------------------------
 
             if customer is not None:
                 is_payment_receipt = False
@@ -1630,26 +1504,20 @@ class MessagingPipeline:
                         )
                     )
 
-                    normalized_classification = (
+                    normalized = (
                         str(classification)
                         .strip()
                         .lower()
-                        .replace(
-                            " ",
-                            "_",
-                        )
-                        .replace(
-                            "-",
-                            "_",
-                        )
+                        .replace(" ", "_")
+                        .replace("-", "_")
                     )
 
                     is_payment_receipt = (
                         "payment_receipt"
-                        in normalized_classification
+                        in normalized
                         or "bank_transfer"
-                        in normalized_classification
-                        or normalized_classification
+                        in normalized
+                        or normalized
                         == (
                             "payment_receipt_or_bank_transfer_"
                             "confirmation"
@@ -1660,8 +1528,7 @@ class MessagingPipeline:
                     logger.warning(
                         (
                             "Image classification failed for "
-                            "conversation %s; treating image as "
-                            "a normal image"
+                            "conversation %s; treating image normally"
                         ),
                         conversation.id,
                         exc_info=True,
@@ -1702,7 +1569,6 @@ class MessagingPipeline:
                                     incoming.external_conversation_id,
                                     confirmation,
                                 )
-
                             except Exception:
                                 logger.warning(
                                     (
@@ -1769,13 +1635,9 @@ class MessagingPipeline:
                     incoming.external_conversation_id,
                     fallback,
                 )
-
             except Exception:
                 logger.warning(
-                    (
-                        "Failed to send image fallback "
-                        "acknowledgement"
-                    ),
+                    "Failed to send image fallback",
                     exc_info=True,
                 )
 
@@ -1784,9 +1646,9 @@ class MessagingPipeline:
                 None,
             )
 
-    # =======================================================================
-    # Voice handling
-    # =======================================================================
+    # ========================================================================
+    # Voice processing
+    # ========================================================================
 
     async def _transcribe_voice(
         self,
@@ -1814,12 +1676,17 @@ class MessagingPipeline:
             audio_data, mime_type = (
                 _normalize_downloaded_media(
                     media_result,
-                    default_mime_type="audio/ogg",
+                    default_mime_type=(
+                        self._get_media_mime_type(
+                            incoming,
+                            "audio/ogg",
+                        )
+                    ),
                 )
             )
 
             logger.info(
-                "Transcribing voice message with mime_type=%s",
+                "Transcribing voice message mime_type=%s",
                 mime_type,
             )
 
@@ -1839,9 +1706,7 @@ class MessagingPipeline:
                     "Audio transcription returned empty text"
                 )
 
-            inbound_message.content = (
-                transcript
-            )
+            inbound_message.content = transcript
 
             await self.db.commit()
 
@@ -1857,20 +1722,17 @@ class MessagingPipeline:
                 exc_info=True,
             )
 
-            fallback_text = (
+            fallback = (
                 str(incoming.text).strip()
                 if incoming.text
                 else ""
             )
 
-            return (
-                fallback_text
-                or None
-            )
+            return fallback or None
 
-    # =======================================================================
+    # ========================================================================
     # Deterministic agent selection
-    # =======================================================================
+    # ========================================================================
 
     async def _pick_agent_without_ai(
         self,
@@ -1878,11 +1740,11 @@ class MessagingPipeline:
         conversation: Conversation,
         integration: PlatformIntegration,
     ) -> Agent:
-        """Select an agent without calling Gemini."""
+        """Select an active agent without calling Gemini."""
 
-        # -------------------------------------------------------------------
-        # 1. Existing conversation assignment
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # 1. Existing conversation agent
+        # --------------------------------------------------------------------
 
         if conversation.agent_id:
             result = await self.db.execute(
@@ -1892,16 +1754,14 @@ class MessagingPipeline:
                 )
             )
 
-            agent = (
-                result.scalar_one_or_none()
-            )
+            agent = result.scalar_one_or_none()
 
             if agent is not None:
                 return agent
 
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
         # 2. Integration default agent
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
 
         default_agent_id = (
             integration.default_agent_id
@@ -1912,19 +1772,18 @@ class MessagingPipeline:
                 select(Agent).where(
                     Agent.id == default_agent_id,
                     Agent.owner_id == owner_id,
+                    Agent.status == AgentStatus.ACTIVE,
                 )
             )
 
-            agent = (
-                result.scalar_one_or_none()
-            )
+            agent = result.scalar_one_or_none()
 
             if agent is not None:
                 return agent
 
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
         # 3. First active owner agent
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
 
         result = await self.db.execute(
             select(Agent)
@@ -1946,53 +1805,33 @@ class MessagingPipeline:
             "No active AI agent is available for this account."
         )
 
-    # =======================================================================
-    # Product image matching
-    # =======================================================================
+    # ========================================================================
+    # Product matching
+    # ========================================================================
 
     async def _find_requested_product(
         self,
         owner_id,
         query: str | None,
     ) -> Product | None:
-        """Find the product the customer is explicitly asking to see.
+        """Find the product explicitly requested by the customer.
 
-        Product search is attempted twice:
+        The cleaned product query is preferred because phrases such as
+        "send me a picture of..." are not useful product-search terms.
 
-        1. Original customer wording.
-        2. Cleaned product wording with image-request language removed.
-
-        IMPORTANT:
-
-        This method selects the best matching product first.
-
-        It does NOT silently replace a matching product without an image
-        with an unrelated product that happens to have an image.
-
-        That prevents this bad behavior:
-
-            Customer asks for Product A.
-            Product A has no image.
-            Search also finds Product B with an image.
-            System sends Product B.
-
-        Instead, if the requested product has no image, no product image
-        is sent.
+        A product without an image is never silently replaced by another
+        product merely because that other product has an image.
         """
 
         if not query:
             return None
 
-        search_queries: list[str] = []
-
         original = str(
             query
         ).strip()
 
-        if original:
-            search_queries.append(
-                original
-            )
+        if not original:
+            return None
 
         cleaned = (
             _normalize_product_search_text(
@@ -2000,17 +1839,23 @@ class MessagingPipeline:
             )
         )
 
-        if (
-            cleaned
-            and cleaned.lower()
-            != original.lower()
-        ):
+        search_queries: list[str] = []
+
+        if cleaned:
             search_queries.append(
                 cleaned
             )
 
+        if (
+            original
+            and original.lower() != cleaned.lower()
+        ):
+            search_queries.append(
+                original
+            )
+
         best_product: Product | None = None
-        best_score: float = float("-inf")
+        best_score = float("-inf")
 
         for search_query in search_queries:
             try:
@@ -2025,14 +1870,19 @@ class MessagingPipeline:
             except Exception:
                 logger.warning(
                     (
-                        "Product search failed while finding "
+                        "Product search failed while matching "
                         "requested product: query=%s"
                     ),
                     search_query,
                     exc_info=True,
                 )
-
                 continue
+
+            if not results:
+                continue
+
+            local_product = None
+            local_score = float("-inf")
 
             for product, score in results:
                 if product is None:
@@ -2042,28 +1892,23 @@ class MessagingPipeline:
                     score or 0
                 )
 
-                if numeric_score > best_score:
-                    best_score = numeric_score
-                    best_product = product
+                if numeric_score > local_score:
+                    local_product = product
+                    local_score = numeric_score
 
-            # The cleaned query is normally more useful because it removes
-            # words such as "send", "photo", "show", etc.
-            #
-            # Once we have a result from the cleaned query, we prefer that
-            # product rather than continuing into potentially unrelated
-            # matches from the original sentence.
-            if (
-                cleaned
-                and search_query == cleaned
-                and best_product is not None
-            ):
-                break
+            if local_product is not None:
+                best_product = local_product
+                best_score = local_score
+
+                # The cleaned query is the preferred query.
+                if search_query == cleaned:
+                    break
 
         if best_product is not None:
             logger.info(
                 (
-                    "Requested product matched: product=%s "
-                    "score=%s query=%s has_image=%s"
+                    "Requested product matched: "
+                    "product=%s score=%s query=%s has_image=%s"
                 ),
                 best_product.id,
                 best_score,
@@ -2073,9 +1918,9 @@ class MessagingPipeline:
 
         return best_product
 
-    # =======================================================================
-    # Build AI response
-    # =======================================================================
+    # ========================================================================
+    # Build AI reply
+    # ========================================================================
 
     async def _build_reply(
         self,
@@ -2092,26 +1937,7 @@ class MessagingPipeline:
         Product | None,
         Product | None,
     ]:
-        """Build context and generate the AI reply.
-
-        Returns:
-
-            reply_text
-            top_semantic_product
-            explicitly_requested_product
-
-        IMPORTANT:
-
-        `top_semantic_product` is contextual information for the AI.
-
-        It is NOT a signal to send a product image.
-
-        Product-image delivery is controlled exclusively by:
-
-            wants_product_image
-            requested_product
-            _product_has_image(requested_product)
-        """
+        """Build context and generate the AI response."""
 
         if not effective_text:
             return (
@@ -2123,9 +1949,9 @@ class MessagingPipeline:
                 None,
             )
 
-        # -------------------------------------------------------------------
-        # RAG: knowledge
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # Knowledge retrieval
+        # --------------------------------------------------------------------
 
         knowledge_results = (
             await self.knowledge_service.search(
@@ -2136,9 +1962,9 @@ class MessagingPipeline:
             )
         )
 
-        # -------------------------------------------------------------------
-        # RAG: memory
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # Memory retrieval
+        # --------------------------------------------------------------------
 
         memory_results = (
             await self.memory_service.search(
@@ -2149,13 +1975,13 @@ class MessagingPipeline:
             )
         )
 
-        # -------------------------------------------------------------------
-        # Product search
+        # --------------------------------------------------------------------
+        # Product retrieval
         #
-        # This is ALWAYS allowed for product-related questions.
+        # IMPORTANT:
         #
-        # However, product search alone NEVER causes an image to be sent.
-        # -------------------------------------------------------------------
+        # Product search does NOT trigger image sending.
+        # --------------------------------------------------------------------
 
         product_results = (
             await self.product_service.search(
@@ -2165,12 +1991,9 @@ class MessagingPipeline:
             )
         )
 
-        # -------------------------------------------------------------------
-        # Explicit requested product.
-        #
-        # Only perform the extra requested-product lookup when the customer
-        # actually requested an image.
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # Explicit image request
+        # --------------------------------------------------------------------
 
         requested_product = None
 
@@ -2182,9 +2005,9 @@ class MessagingPipeline:
                 )
             )
 
-        # -------------------------------------------------------------------
-        # Conversation history.
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # Conversation history
+        # --------------------------------------------------------------------
 
         history = (
             await self.conversation_service.get_recent_messages(
@@ -2193,9 +2016,9 @@ class MessagingPipeline:
             )
         )
 
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
         # System instruction
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
 
         system_instruction = (
             self._build_system_instruction(
@@ -2206,28 +2029,16 @@ class MessagingPipeline:
             )
         )
 
-        # -------------------------------------------------------------------
-        # Messaging capability instruction
-        #
-        # This is important because Gemini may otherwise believe that it
-        # physically controls the messaging platform.
-        #
-        # The backend is responsible for sending product images.
-        # -------------------------------------------------------------------
-
         messaging_capability_instruction = """
 Messaging capabilities:
 
-- You are operating inside a customer messaging platform.
+- You operate inside a customer messaging platform.
 - The application can send product images separately from your text reply.
-- Do not say that you cannot send images.
-- Do not say that the chat system does not support images.
-- Do not say that you wish you could send a photo.
-- Do not invent an image URL.
-- Do not claim that an image was delivered unless the application has
-  actually sent it.
-- For normal product questions, answer normally and do not suggest that
-  an image will be sent unless the customer explicitly asked to see one.
+- Do not claim that you cannot send images.
+- Do not invent image URLs.
+- Do not claim an image was delivered unless the application actually sent it.
+- For normal product questions, answer normally.
+- Do not promise an image unless the customer explicitly requested one.
 """.strip()
 
         system_instruction = (
@@ -2235,30 +2046,25 @@ Messaging capabilities:
             f"{messaging_capability_instruction}"
         ).strip()
 
-        # -------------------------------------------------------------------
-        # Explicit product image request.
-        #
-        # The backend sends the image separately.
-        #
-        # Gemini only needs to produce natural text.
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # Explicit image request context
+        # --------------------------------------------------------------------
 
         if requested_product is not None:
             system_instruction = (
                 f"{system_instruction}\n\n"
                 "PRODUCT IMAGE REQUEST:\n"
-                "The customer has explicitly requested to see a product "
-                "image. The application will attempt to send the matching "
-                "product image separately after your text response. "
-                "Respond naturally and briefly. Do not say that you cannot "
-                "send images. Do not claim that the image has already been "
-                "delivered. Do not invent an image URL or attachment.\n"
+                "The customer explicitly requested to see a product image. "
+                "The application will attempt to send the matching product "
+                "image separately after the text response. Respond naturally "
+                "and briefly. Do not claim that the image has already been "
+                "delivered.\n"
                 f"Requested product: {requested_product.name}"
             )
 
-        # -------------------------------------------------------------------
-        # Conversation prompt
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # Build conversation prompt
+        # --------------------------------------------------------------------
 
         prompt = self._build_prompt(
             history=history,
@@ -2266,9 +2072,9 @@ Messaging capabilities:
             current_message_id=inbound_message.id,
         )
 
-        # -------------------------------------------------------------------
-        # Customer-aware tool calling.
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # Generate with tools when customer exists
+        # --------------------------------------------------------------------
 
         if customer is not None:
             context = ToolContext(
@@ -2316,31 +2122,19 @@ Messaging capabilities:
                 "AI provider returned an empty response"
             )
 
-        # -------------------------------------------------------------------
-        # Normal semantic product context.
+        # --------------------------------------------------------------------
+        # Determine semantic product context.
         #
-        # IMPORTANT:
-        #
-        # This does NOT mean an image should be sent.
-        #
-        # It simply identifies the most relevant product for the AI's
-        # response/context.
-        # -------------------------------------------------------------------
+        # This does NOT trigger image delivery.
+        # --------------------------------------------------------------------
 
         top_product = None
 
         if product_results:
-            best_product, _best_score = (
-                product_results[0]
-            )
+            best_product, _score = product_results[0]
 
             if best_product is not None:
                 top_product = best_product
-
-        # -------------------------------------------------------------------
-        # Explicit image request takes priority for requested-product
-        # context.
-        # -------------------------------------------------------------------
 
         if requested_product is not None:
             top_product = requested_product
@@ -2351,9 +2145,9 @@ Messaging capabilities:
             requested_product,
         )
 
-    # =======================================================================
-    # System prompt
-    # =======================================================================
+    # ========================================================================
+    # System instruction
+    # ========================================================================
 
     @staticmethod
     def _build_system_instruction(
@@ -2362,24 +2156,23 @@ Messaging capabilities:
         memory_results,
         product_results,
     ) -> str:
-        """Build the system instruction supplied to the AI model."""
+        """Build the AI system instruction."""
 
         parts: list[str] = []
 
         if agent.instructions:
             parts.append(
-                str(agent.instructions)
+                str(agent.instructions).strip()
             )
 
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
         # Knowledge
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
 
         if knowledge_results:
             knowledge_lines = "\n".join(
                 f"- {chunk.content}"
-                for chunk, _score
-                in knowledge_results
+                for chunk, _score in knowledge_results
                 if chunk.content
             )
 
@@ -2389,15 +2182,14 @@ Messaging capabilities:
                     f"{knowledge_lines}"
                 )
 
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
         # Memory
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
 
         if memory_results:
             memory_lines = "\n".join(
                 f"- {entry.content}"
-                for entry, _score
-                in memory_results
+                for entry, _score in memory_results
                 if entry.content
             )
 
@@ -2407,46 +2199,53 @@ Messaging capabilities:
                     f"{memory_lines}"
                 )
 
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
         # Products
-        # -------------------------------------------------------------------
+        # --------------------------------------------------------------------
 
         if product_results:
-            product_lines = "\n".join(
-                (
+            product_lines = []
+
+            for product, _score in product_results:
+                if product is None:
+                    continue
+
+                line = (
                     f"- {product.name}: "
                     f"{product.price} {product.currency}"
-                    + (
-                        f" ({product.discount_percent:g}% off)"
-                        if product.discount_percent
-                        else ""
-                    )
-                    + (
-                        f" - {product.description}"
-                        if product.description
-                        else ""
-                    )
                 )
-                for product, _score
-                in product_results
-            )
+
+                if product.discount_percent:
+                    line += (
+                        f" "
+                        f"({product.discount_percent:g}% off)"
+                    )
+
+                if product.description:
+                    line += (
+                        f" - {product.description}"
+                    )
+
+                product_lines.append(
+                    line
+                )
 
             if product_lines:
                 parts.append(
                     "Relevant products/services you can sell:\n"
-                    f"{product_lines}"
+                    + "\n".join(product_lines)
                 )
 
         return "\n\n".join(
-            part.strip()
+            part
             for part in parts
             if part
             and str(part).strip()
         )
 
-    # =======================================================================
+    # ========================================================================
     # Conversation prompt
-    # =======================================================================
+    # ========================================================================
 
     @staticmethod
     def _build_prompt(
@@ -2459,9 +2258,9 @@ Messaging capabilities:
         lines: list[str] = []
 
         for message in history:
-            # ----------------------------------------------------------------
-            # Skip current inbound message.
-            # ----------------------------------------------------------------
+            # ---------------------------------------------------------------
+            # Do not add current inbound message twice.
+            # ---------------------------------------------------------------
 
             if (
                 current_message_id is not None
@@ -2469,9 +2268,9 @@ Messaging capabilities:
             ):
                 continue
 
-            # ----------------------------------------------------------------
-            # Customer messages.
-            # ----------------------------------------------------------------
+            # ---------------------------------------------------------------
+            # Customer
+            # ---------------------------------------------------------------
 
             if message.role == MessageRole.USER:
                 if message.content:
@@ -2479,9 +2278,9 @@ Messaging capabilities:
                         f"Customer: {message.content}"
                     )
 
-            # ----------------------------------------------------------------
-            # Agent messages.
-            # ----------------------------------------------------------------
+            # ---------------------------------------------------------------
+            # AI/agent
+            # ---------------------------------------------------------------
 
             elif message.role == MessageRole.AGENT:
                 if message.content:
@@ -2490,7 +2289,7 @@ Messaging capabilities:
                     )
 
         # --------------------------------------------------------------------
-        # Add current user turn exactly once.
+        # Current user turn exactly once.
         # --------------------------------------------------------------------
 
         if latest_text:
@@ -2499,13 +2298,11 @@ Messaging capabilities:
             )
 
         # --------------------------------------------------------------------
-        # Ask model to produce next assistant response.
+        # Model response marker.
         # --------------------------------------------------------------------
 
         lines.append(
             "You:"
         )
 
-        return "\n".join(
-            lines
-        )
+        return "\n".join(lines)
