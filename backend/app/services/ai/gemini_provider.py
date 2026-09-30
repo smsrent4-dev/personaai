@@ -1,3 +1,4 @@
+
 """Google Gemini implementation of AIProvider.
 
 PersonaAI Gemini provider using the Gemini REST API over httpx.
@@ -7,7 +8,7 @@ Production features:
 - Exponential backoff with jitter
 - Retry-After support
 - Primary + fallback model routing
-- Automatic fallback on repeated 429/5xx failures
+- Automatic fallback on repeated transient failures
 - Correct authentication/error handling
 - Gemini function/tool calling
 - Preservation of Gemini model response parts
@@ -63,7 +64,22 @@ RETIRED_EMBEDDING_MODELS = {
 # RETRIES
 # ============================================================================
 
+# Gemini documents these as transient/retryable errors:
+#
+#   408 Request Timeout
+#   429 Resource Exhausted / Rate Limit
+#   5xx Server Errors
+#
+# Do NOT retry normal client/configuration errors such as:
+#
+#   400 Bad Request
+#   401 Unauthorized
+#   402 Payment Required / depleted credits
+#   403 Forbidden
+#   404 Not Found
+
 TRANSIENT_STATUS_CODES = {
+    408,
     429,
     500,
     502,
@@ -71,19 +87,37 @@ TRANSIENT_STATUS_CODES = {
     504,
 }
 
-# Two attempts per model:
+# Number of RETRIES after the initial request.
 #
-# attempt 1
-# attempt 2
+# Total requests per model:
 #
-# Then immediately move to fallback.
-MAX_RETRIES_PER_MODEL = 2
+#   Initial request
+#   Retry 1
+#   Retry 2
+#   Retry 3
+#   Retry 4
+#
+# = 5 total attempts per model.
+MAX_RETRIES_PER_MODEL = 4
+
+# Exponential backoff:
+#
+# Retry 1 -> approximately 1 second
+# Retry 2 -> approximately 2 seconds
+# Retry 3 -> approximately 4 seconds
+# Retry 4 -> approximately 8 seconds
+#
+# Jitter is added to prevent multiple workers from retrying at exactly
+# the same time.
 
 INITIAL_RETRY_DELAY = 1.0
-MAX_RETRY_DELAY = 4.0
+MAX_RETRY_DELAY = 60.0
 
-# Never allow Retry-After to block a customer request for an excessive time.
-MAX_RETRY_AFTER = 8.0
+# Maximum amount of time PersonaAI will honor from Gemini's Retry-After
+# header. This prevents a single customer request from being blocked
+# indefinitely.
+
+MAX_RETRY_AFTER = 60.0
 
 
 # ============================================================================
@@ -98,6 +132,7 @@ MAX_RETRY_AFTER = 8.0
 #
 # PersonaAI is a real-time customer conversation system, so LOW is the
 # default. This keeps latency and token consumption under control.
+
 DEFAULT_THINKING_LEVEL = "low"
 
 VALID_THINKING_LEVELS = {
@@ -308,15 +343,27 @@ class GeminiProvider(AIProvider):
 
     @staticmethod
     def _calculate_backoff(
-        attempt: int,
+        retry_number: int,
     ) -> float:
-        """Calculate exponential backoff with jitter."""
+        """Calculate exponential backoff with jitter.
+
+        Approximate delays:
+
+            retry 1 -> 1s + jitter
+            retry 2 -> 2s + jitter
+            retry 3 -> 4s + jitter
+            retry 4 -> 8s + jitter
+
+        The delay is capped at MAX_RETRY_DELAY.
+        """
 
         base_delay = min(
-            INITIAL_RETRY_DELAY * (2 ** (attempt - 1)),
+            INITIAL_RETRY_DELAY
+            * (2 ** (retry_number - 1)),
             MAX_RETRY_DELAY,
         )
 
+        # Add up to 25% random jitter.
         jitter = random.uniform(
             0,
             base_delay * 0.25,
@@ -343,12 +390,32 @@ class GeminiProvider(AIProvider):
     ) -> dict[str, Any]:
         """POST request to Gemini with production retry handling.
 
-        Important:
-        The API key is deliberately sent using the x-goog-api-key header
-        instead of a ?key= query parameter.
+        Retryable:
+            408
+            429
+            500
+            502
+            503
+            504
+            timeouts
+            transport errors
 
-        This prevents the secret from appearing in HTTP request URLs and
-        therefore reduces the chance of it being leaked into logs.
+        Non-retryable:
+            400
+            401
+            402
+            403
+            404
+            other client errors
+
+        Retry strategy:
+            exponential backoff + jitter
+
+        Retry-After:
+            respected when Gemini provides it.
+
+        The API key is sent through x-goog-api-key instead of a URL
+        query parameter so it does not appear in request URLs.
         """
 
         if not self.api_key:
@@ -364,9 +431,21 @@ class GeminiProvider(AIProvider):
 
         last_error: _TransientAIError | None = None
 
+        # MAX_RETRIES_PER_MODEL = 4 means:
+        #
+        # attempt 1 = initial request
+        # attempt 2 = retry 1
+        # attempt 3 = retry 2
+        # attempt 4 = retry 3
+        # attempt 5 = retry 4
+        #
+        # Therefore range() goes through 5 total requests.
+
+        total_attempts = MAX_RETRIES_PER_MODEL + 1
+
         for attempt in range(
             1,
-            MAX_RETRIES_PER_MODEL + 1,
+            total_attempts + 1,
         ):
             last_error = None
 
@@ -378,6 +457,7 @@ class GeminiProvider(AIProvider):
                 )
 
             except httpx.TimeoutException as exc:
+                # Network timeout is transient and should be retried.
                 last_error = _TransientAIError(
                     f"Gemini request timed out: {exc}"
                 )
@@ -388,11 +468,12 @@ class GeminiProvider(AIProvider):
                         "attempt=%s/%s path=%s"
                     ),
                     attempt,
-                    MAX_RETRIES_PER_MODEL,
+                    total_attempts,
                     path,
                 )
 
             except httpx.TransportError as exc:
+                # Transport errors are transient.
                 last_error = _TransientAIError(
                     f"Gemini transport error: {exc}"
                 )
@@ -403,7 +484,7 @@ class GeminiProvider(AIProvider):
                         "attempt=%s/%s path=%s error=%s"
                     ),
                     attempt,
-                    MAX_RETRIES_PER_MODEL,
+                    total_attempts,
                     path,
                     exc,
                 )
@@ -411,9 +492,9 @@ class GeminiProvider(AIProvider):
             else:
                 status = response.status_code
 
-                # -------------------------------------------------------------
+                # =============================================================
                 # SUCCESS
-                # -------------------------------------------------------------
+                # =============================================================
 
                 if 200 <= status < 300:
                     try:
@@ -426,9 +507,11 @@ class GeminiProvider(AIProvider):
                             exc,
                         ) from exc
 
-                # -------------------------------------------------------------
-                # AUTHENTICATION
-                # -------------------------------------------------------------
+                # =============================================================
+                # AUTHENTICATION / AUTHORIZATION
+                #
+                # Do NOT retry these.
+                # =============================================================
 
                 if status in (401, 403):
                     raise AIAuthenticationError(
@@ -439,67 +522,45 @@ class GeminiProvider(AIProvider):
                         self.name,
                     )
 
-                # -------------------------------------------------------------
-                # RATE LIMIT
-                # -------------------------------------------------------------
+                # =============================================================
+                # TRANSIENT ERROR
+                #
+                # Retry 408, 429 and 5xx.
+                # =============================================================
 
-                if status == 429:
+                if status in TRANSIENT_STATUS_CODES:
                     retry_after = self._parse_retry_after(
                         response
                     )
 
                     last_error = _TransientAIError(
                         (
-                            "Gemini rate limit exceeded: "
+                            f"Gemini returned {status}: "
                             f"{response.text}"
                         ),
-                        status_code=429,
+                        status_code=status,
                         retry_after=retry_after,
                     )
 
                     logger.warning(
                         (
-                            "Gemini rate limit "
-                            "attempt=%s/%s retry_after=%s path=%s"
+                            "Gemini transient error "
+                            "attempt=%s/%s status=%s "
+                            "retry_after=%s path=%s"
                         ),
                         attempt,
-                        MAX_RETRIES_PER_MODEL,
+                        total_attempts,
+                        status,
                         retry_after,
                         path,
                     )
 
-                # -------------------------------------------------------------
-                # TRANSIENT SERVER FAILURE
-                # -------------------------------------------------------------
-
-                elif status in {
-                    500,
-                    502,
-                    503,
-                    504,
-                }:
-                    last_error = _TransientAIError(
-                        (
-                            f"Gemini returned {status}: "
-                            f"{response.text}"
-                        ),
-                        status_code=status,
-                    )
-
-                    logger.warning(
-                        (
-                            "Gemini transient error "
-                            "attempt=%s/%s status=%s path=%s"
-                        ),
-                        attempt,
-                        MAX_RETRIES_PER_MODEL,
-                        status,
-                        path,
-                    )
-
-                # -------------------------------------------------------------
-                # OTHER CLIENT/SERVER ERROR
-                # -------------------------------------------------------------
+                # =============================================================
+                # NON-RETRYABLE ERROR
+                #
+                # 400 / 402 / 403 / 404 and other client/configuration errors
+                # are returned immediately.
+                # =============================================================
 
                 elif status >= 400:
                     raise AIProviderError(
@@ -519,34 +580,53 @@ class GeminiProvider(AIProvider):
                         self.name,
                     )
 
-            # -----------------------------------------------------------------
-            # RETRY
-            # -----------------------------------------------------------------
+            # =================================================================
+            # RETRY DECISION
+            # =================================================================
 
             if last_error is None:
                 continue
 
-            if attempt >= MAX_RETRIES_PER_MODEL:
+            # All attempts for this model have been exhausted.
+            if attempt >= total_attempts:
                 break
 
+            # Gemini explicitly supplied Retry-After.
             if last_error.retry_after is not None:
                 delay = last_error.retry_after
+
+                logger.info(
+                    (
+                        "Gemini Retry-After received: "
+                        "%.2fs"
+                    ),
+                    delay,
+                )
+
+            # Otherwise use exponential backoff + jitter.
             else:
+                retry_number = attempt
+
                 delay = self._calculate_backoff(
-                    attempt
+                    retry_number
                 )
 
             logger.info(
                 (
                     "Retrying Gemini request in %.2fs "
-                    "(attempt %s/%s)"
+                    "(retry=%s/%s status=%s)"
                 ),
                 delay,
-                attempt + 1,
+                attempt,
                 MAX_RETRIES_PER_MODEL,
+                last_error.status_code,
             )
 
             await asyncio.sleep(delay)
+
+        # =====================================================================
+        # ALL RETRIES EXHAUSTED
+        # =====================================================================
 
         if last_error is not None:
             raise last_error
@@ -590,10 +670,8 @@ class GeminiProvider(AIProvider):
             )
 
             try:
-                # -------------------------------------------------------------
                 # Make a shallow copy so one model's generation configuration
-                # cannot accidentally mutate the next model's request.
-                # -------------------------------------------------------------
+                # cannot mutate the next model's request.
 
                 model_body = dict(body)
 
@@ -1228,12 +1306,10 @@ class GeminiProvider(AIProvider):
             .strip("'")
         )
 
-        # Exact case-insensitive match first.
         for label in labels:
             if cleaned.lower() == label.lower():
                 return label
 
-        # Then allow a response containing the label.
         for label in labels:
             if label.lower() in cleaned.lower():
                 return label
@@ -1419,14 +1495,10 @@ class GeminiProvider(AIProvider):
 
         3. Return the tool result using functionResponse.
 
-        4. Do NOT put `call_id` inside functionResponse.
-           The current Gemini REST schema rejects it there and returns:
-
-               Unknown name "call_id" at
-               'contents[...].parts[0].function_response'
+        4. Do NOT put call_id inside functionResponse.
 
         5. The model's original functionCall part is preserved in the
-           preceding `role=model` content.
+           preceding role=model content.
         """
 
         if not tools:
@@ -1445,10 +1517,6 @@ class GeminiProvider(AIProvider):
                 self.name,
             )
 
-        # ---------------------------------------------------------------------
-        # Conversation sent to Gemini.
-        # ---------------------------------------------------------------------
-
         contents: list[dict[str, Any]] = [
             {
                 "role": "user",
@@ -1460,10 +1528,6 @@ class GeminiProvider(AIProvider):
             }
         ]
 
-        # ---------------------------------------------------------------------
-        # Tool definitions.
-        # ---------------------------------------------------------------------
-
         function_declarations = [
             {
                 "name": tool.name,
@@ -1472,10 +1536,6 @@ class GeminiProvider(AIProvider):
             }
             for tool in tools
         ]
-
-        # ---------------------------------------------------------------------
-        # System instruction.
-        # ---------------------------------------------------------------------
 
         base_system_prompt = (
             system_instruction or ""
@@ -1542,16 +1602,6 @@ class GeminiProvider(AIProvider):
                 )
             )
 
-            # -----------------------------------------------------------------
-            # Preserve every part Gemini returned.
-            #
-            # Do NOT rebuild this from only functionCall objects.
-            #
-            # Gemini 3 models can attach thought signatures and other metadata
-            # to response parts. Preserving the complete parts array keeps the
-            # next turn valid.
-            # -----------------------------------------------------------------
-
             parts = self._extract_candidate_parts(
                 data
             )
@@ -1600,7 +1650,7 @@ class GeminiProvider(AIProvider):
                 )
 
             # =================================================================
-            # PRESERVE MODEL RESPONSE
+            # PRESERVE COMPLETE MODEL RESPONSE
             # =================================================================
 
             contents.append(
@@ -1627,12 +1677,13 @@ class GeminiProvider(AIProvider):
                     "args"
                 ) or {}
 
-                # Gemini may provide an identifier for the call.
+                # Gemini may provide an identifier.
                 #
                 # We only use it for logging.
                 #
                 # IMPORTANT:
-                # Do NOT send this value inside functionResponse.
+                # Do not send this value inside functionResponse.
+
                 tool_call_id = (
                     function_call.get("id")
                     or function_call.get("call_id")
@@ -1709,9 +1760,6 @@ class GeminiProvider(AIProvider):
                             tool_name,
                         )
 
-                        # Never allow one tool exception to crash the entire
-                        # Gemini conversation. Return the error to Gemini so
-                        # it can decide how to continue.
                         result = {
                             "error": str(exc),
                         }
@@ -1719,29 +1767,8 @@ class GeminiProvider(AIProvider):
                 # -------------------------------------------------------------
                 # Gemini functionResponse
                 #
-                # IMPORTANT FIX:
-                #
-                # There is intentionally NO `call_id` here.
-                #
-                # The previous implementation generated:
-                #
-                #     "functionResponse": {
-                #         "name": "...",
-                #         "call_id": "...",
-                #         "response": {...}
-                #     }
-                #
-                # Gemini rejected that with HTTP 400:
-                #
-                # Unknown name "call_id" at
-                # contents[2].parts[0].function_response
-                #
-                # The correct payload for the REST schema being used here is:
-                #
-                #     "functionResponse": {
-                #         "name": "...",
-                #         "response": {...}
-                #     }
+                # IMPORTANT:
+                # There is intentionally NO call_id here.
                 # -------------------------------------------------------------
 
                 function_response = {
