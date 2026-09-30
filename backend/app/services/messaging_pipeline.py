@@ -17,12 +17,18 @@ Flow:
 13. Send the text response.
 14. Send a product image ONLY when the customer explicitly requested one.
 
-Important production rules:
+Production AI-request rules:
 
+- An already-assigned conversation does NOT call the AI router again.
+- A conversation with one active agent does NOT call the AI router.
+- AI routing is only used when a conversation has no valid assigned
+  agent and multiple active agents are available.
+- The selected agent is persisted on the conversation.
 - Gemini/provider retries remain inside the AI provider.
 - This pipeline does not retry the entire inbound message.
+- Tool calling is limited to 2 iterations for normal customer messaging.
 - Routing errors and generation errors are logged separately.
-- Routing failures fall back to a deterministic agent.
+- Routing failures fall back to deterministic agent selection.
 - Payment receipt images are NOT treated as payment confirmation.
 - Platform media results are normalized before AI processing.
 - Product-image sending is controlled by application logic.
@@ -64,6 +70,22 @@ from app.services.tools import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Production AI limits
+# ============================================================================
+
+# Customer messaging should normally require:
+#
+#   Gemini -> final answer
+#
+# or:
+#
+#   Gemini -> tool call -> Gemini -> final answer
+#
+# Keeping this low prevents long tool loops from multiplying API requests.
+_MAX_TOOL_ITERATIONS = 2
 
 
 # ============================================================================
@@ -926,48 +948,43 @@ class MessagingPipeline:
 
             # ----------------------------------------------------------------
             # 12. Select agent
+            #
+            # IMPORTANT:
+            #
+            # We deliberately DO NOT call AI routing for every message.
+            #
+            # Existing conversation assignment:
+            #     conversation.agent_id -> use it directly.
+            #
+            # No assignment + one active agent:
+            #     use that agent directly.
+            #
+            # No assignment + multiple active agents:
+            #     call AI router once and persist the result.
             # ----------------------------------------------------------------
 
             agent = None
 
             try:
-                if effective_text:
-                    logger.info(
-                        "Routing message for conversation %s",
-                        conversation.id,
-                    )
+                agent = await self._select_agent(
+                    owner_id=owner.id,
+                    conversation=conversation,
+                    integration=integration,
+                    message=effective_text,
+                )
 
-                    agent = await self.router_service.route(
-                        owner.id,
-                        effective_text,
-                    )
-
-                    logger.info(
-                        (
-                            "AI routing selected agent %s "
-                            "for conversation %s"
-                        ),
-                        getattr(
-                            agent,
-                            "id",
-                            None,
-                        ),
-                        conversation.id,
-                    )
-
-                else:
-                    agent = (
-                        await self._pick_agent_without_ai(
-                            owner.id,
-                            conversation,
-                            integration,
-                        )
-                    )
+                logger.info(
+                    (
+                        "Agent selected: conversation=%s agent=%s"
+                    ),
+                    conversation.id,
+                    getattr(agent, "id", None),
+                )
 
             except Exception:
                 logger.error(
                     (
-                        "AI routing failed for conversation %s; "
+                        "Agent selection failed for conversation %s; "
                         "using deterministic fallback"
                     ),
                     conversation.id,
@@ -994,27 +1011,6 @@ class MessagingPipeline:
                     )
 
                     agent = None
-
-            # ----------------------------------------------------------------
-            # Persist selected agent when available.
-            # ----------------------------------------------------------------
-
-            if agent is not None:
-                try:
-                    if conversation.agent_id != agent.id:
-                        conversation.agent_id = agent.id
-                        await self.db.commit()
-                except Exception:
-                    await self.db.rollback()
-
-                    logger.warning(
-                        (
-                            "Could not persist agent assignment for "
-                            "conversation %s"
-                        ),
-                        conversation.id,
-                        exc_info=True,
-                    )
 
             # ----------------------------------------------------------------
             # 13. Generate AI response
@@ -1230,6 +1226,217 @@ class MessagingPipeline:
                         "Platform adapter close failed",
                         exc_info=True,
                     )
+
+    # ========================================================================
+    # Agent selection
+    # ========================================================================
+
+    async def _select_agent(
+        self,
+        owner_id,
+        conversation: Conversation,
+        integration: PlatformIntegration,
+        message: str | None,
+    ) -> Agent:
+        """Select an agent while minimizing unnecessary AI routing.
+
+        Decision tree:
+
+            1. Existing active conversation agent
+                    ↓
+                  use it
+
+            2. No assigned agent + one active agent
+                    ↓
+                  use it
+
+            3. No assigned agent + multiple active agents
+                    ↓
+                  AI route once
+                    ↓
+                  persist assignment
+
+        This is intentionally different from routing every message.
+        Once a conversation has an agent, future messages stay with that
+        agent unless another part of the application explicitly changes
+        `conversation.agent_id`.
+        """
+
+        # --------------------------------------------------------------------
+        # 1. Reuse existing active conversation assignment.
+        #
+        # This is the most important API-call reduction.
+        # --------------------------------------------------------------------
+
+        if conversation.agent_id:
+            result = await self.db.execute(
+                select(Agent).where(
+                    Agent.id == conversation.agent_id,
+                    Agent.owner_id == owner_id,
+                    Agent.status == AgentStatus.ACTIVE,
+                )
+            )
+
+            assigned_agent = result.scalar_one_or_none()
+
+            if assigned_agent is not None:
+                logger.info(
+                    (
+                        "Reusing existing conversation agent; "
+                        "AI routing skipped: conversation=%s agent=%s"
+                    ),
+                    conversation.id,
+                    assigned_agent.id,
+                )
+
+                return assigned_agent
+
+            logger.warning(
+                (
+                    "Conversation %s has an invalid/inactive agent "
+                    "assignment; selecting a new active agent"
+                ),
+                conversation.id,
+            )
+
+        # --------------------------------------------------------------------
+        # 2. Load active agents.
+        # --------------------------------------------------------------------
+
+        result = await self.db.execute(
+            select(Agent)
+            .where(
+                Agent.owner_id == owner_id,
+                Agent.status == AgentStatus.ACTIVE,
+            )
+            .order_by(
+                Agent.created_at.asc()
+            )
+        )
+
+        active_agents = list(
+            result.scalars().all()
+        )
+
+        if not active_agents:
+            raise RuntimeError(
+                "No active AI agent is available for this account."
+            )
+
+        # --------------------------------------------------------------------
+        # 3. Only one active agent -> no Gemini routing.
+        # --------------------------------------------------------------------
+
+        if len(active_agents) == 1:
+            agent = active_agents[0]
+
+            logger.info(
+                (
+                    "Only one active agent exists; "
+                    "AI routing skipped: conversation=%s agent=%s"
+                ),
+                conversation.id,
+                agent.id,
+            )
+
+            await self._persist_agent_assignment(
+                conversation,
+                agent,
+            )
+
+            return agent
+
+        # --------------------------------------------------------------------
+        # 4. Multiple active agents + no assignment -> AI route.
+        # --------------------------------------------------------------------
+
+        if not message:
+            logger.info(
+                (
+                    "No text available for AI routing; "
+                    "using deterministic agent selection: "
+                    "conversation=%s"
+                ),
+                conversation.id,
+            )
+
+            agent = await self._pick_agent_without_ai(
+                owner_id,
+                conversation,
+                integration,
+            )
+
+            await self._persist_agent_assignment(
+                conversation,
+                agent,
+            )
+
+            return agent
+
+        logger.info(
+            (
+                "No assigned agent and multiple active agents exist; "
+                "calling AI router: conversation=%s active_agents=%s"
+            ),
+            conversation.id,
+            len(active_agents),
+        )
+
+        agent = await self.router_service.route(
+            owner_id,
+            message,
+        )
+
+        if agent.status != AgentStatus.ACTIVE:
+            raise RuntimeError(
+                "AI router selected an inactive agent."
+            )
+
+        await self._persist_agent_assignment(
+            conversation,
+            agent,
+        )
+
+        logger.info(
+            (
+                "AI routing completed and assignment persisted: "
+                "conversation=%s agent=%s"
+            ),
+            conversation.id,
+            agent.id,
+        )
+
+        return agent
+
+    async def _persist_agent_assignment(
+        self,
+        conversation: Conversation,
+        agent: Agent,
+    ) -> None:
+        """Persist the selected agent on the conversation."""
+
+        if conversation.agent_id == agent.id:
+            return
+
+        try:
+            conversation.agent_id = agent.id
+            await self.db.commit()
+
+        except Exception:
+            await self.db.rollback()
+
+            logger.warning(
+                (
+                    "Could not persist agent assignment for "
+                    "conversation %s"
+                ),
+                conversation.id,
+                exc_info=True,
+            )
+
+            # The selected agent is still usable for the current request.
+            # We deliberately do not fail the customer's message only
+            # because persistence of the assignment failed.
 
     # ========================================================================
     # Plan limit
@@ -1743,7 +1950,7 @@ class MessagingPipeline:
         """Select an active agent without calling Gemini."""
 
         # --------------------------------------------------------------------
-        # 1. Existing conversation agent
+        # 1. Existing active conversation agent
         # --------------------------------------------------------------------
 
         if conversation.agent_id:
@@ -1751,6 +1958,7 @@ class MessagingPipeline:
                 select(Agent).where(
                     Agent.id == conversation.agent_id,
                     Agent.owner_id == owner_id,
+                    Agent.status == AgentStatus.ACTIVE,
                 )
             )
 
@@ -2074,6 +2282,11 @@ Messaging capabilities:
 
         # --------------------------------------------------------------------
         # Generate with tools when customer exists
+        #
+        # IMPORTANT:
+        #
+        # max_tool_iterations=2 means we prevent an unnecessarily long
+        # Gemini tool loop in the real-time messaging path.
         # --------------------------------------------------------------------
 
         if customer is not None:
@@ -2094,6 +2307,16 @@ Messaging capabilities:
                     context,
                 )
 
+            logger.info(
+                (
+                    "Starting tool-enabled AI generation: "
+                    "conversation=%s agent=%s max_tool_iterations=%s"
+                ),
+                conversation.id,
+                agent.id,
+                _MAX_TOOL_ITERATIONS,
+            )
+
             reply_text = (
                 await self.router_service.ai_provider.generate_with_tools(
                     prompt,
@@ -2101,10 +2324,20 @@ Messaging capabilities:
                     tool_executor=tool_executor,
                     system_instruction=system_instruction,
                     temperature=agent.temperature,
+                    max_tool_iterations=_MAX_TOOL_ITERATIONS,
                 )
             )
 
         else:
+            logger.info(
+                (
+                    "Starting standard AI generation: "
+                    "conversation=%s agent=%s"
+                ),
+                conversation.id,
+                agent.id,
+            )
+
             reply_text = (
                 await self.router_service.ai_provider.generate(
                     prompt,
