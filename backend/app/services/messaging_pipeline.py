@@ -36,6 +36,8 @@ Production AI-request rules:
 - Normal product searches NEVER automatically send product images.
 - AI automation is blocked unless the owner's subscription is ACTIVE.
 - Billing remains accessible even when the subscription is inactive.
+- Plan-limit notifications are created directly through the Notification
+  model because NotificationService does not expose create_notification().
 """
 
 from __future__ import annotations
@@ -62,7 +64,6 @@ from app.services.conversation_service import ConversationService
 from app.services.customer_service import CustomerService
 from app.services.knowledge import KnowledgeService
 from app.services.memory_service import MemoryService
-from app.services.notification_service import NotificationService
 from app.services.order_service import OrderService
 from app.services.platforms.registry import build_adapter
 from app.services.product_service import ProductService
@@ -761,32 +762,27 @@ class MessagingPipeline:
             # ----------------------------------------------------------------
             # 7. Subscription access
             #
-            # IMPORTANT:
-            #
             # Webhook messages do not pass through FastAPI dependencies.
             # Therefore require_active_subscription() cannot protect this
             # execution path.
             #
-            # We check the subscription directly here BEFORE:
+            # This check MUST happen before any AI/Gemini operation,
+            # including:
             #
-            # - auto reply
-            # - business-hours AI response
-            # - plan-limit processing
             # - image analysis
-            # - payment-receipt classification
+            # - payment receipt classification
             # - voice transcription
             # - product retrieval
             # - AI routing
-            # - Gemini generation
+            # - AI generation
             #
-            # Billing remains accessible through normal authenticated
-            # billing endpoints.
+            # Billing remains accessible through billing endpoints.
             # ----------------------------------------------------------------
 
             (
                 subscription_allowed,
                 subscription,
-                subscription_plan,
+                _subscription_plan,
             ) = await check_subscription_access(
                 self.db,
                 owner.id,
@@ -986,13 +982,15 @@ class MessagingPipeline:
                     message=effective_text,
                 )
 
-                logger.info(
-                    (
-                        "Agent selected: conversation=%s agent=%s"
-                    ),
-                    conversation.id,
-                    getattr(agent, "id", None),
-                )
+                if agent is not None:
+                    logger.info(
+                        (
+                            "Agent selected: "
+                            "conversation=%s agent=%s"
+                        ),
+                        conversation.id,
+                        agent.id,
+                    )
 
             except Exception:
                 logger.error(
@@ -1135,11 +1133,11 @@ class MessagingPipeline:
                     exc_info=True,
                 )
 
-                # Do not retry the entire pipeline.
+                # Do not retry the entire inbound pipeline.
                 return
 
             # ----------------------------------------------------------------
-            # 17. Send product image only when explicitly requested
+            # 17. Send product image ONLY when explicitly requested
             # ----------------------------------------------------------------
 
             if (
@@ -1336,7 +1334,7 @@ class MessagingPipeline:
             return agent
 
         # --------------------------------------------------------------------
-        # 4. Multiple active agents + no assignment -> AI route.
+        # 4. Multiple active agents + no message -> deterministic fallback.
         # --------------------------------------------------------------------
 
         if not message:
@@ -1362,6 +1360,10 @@ class MessagingPipeline:
 
             return agent
 
+        # --------------------------------------------------------------------
+        # 5. Multiple active agents + no assignment -> AI route.
+        # --------------------------------------------------------------------
+
         logger.info(
             (
                 "No assigned agent and multiple active agents exist; "
@@ -1375,6 +1377,16 @@ class MessagingPipeline:
             owner_id,
             message,
         )
+
+        if agent is None:
+            raise RuntimeError(
+                "AI router returned no agent."
+            )
+
+        if agent.owner_id != owner_id:
+            raise RuntimeError(
+                "AI router returned an agent belonging to another owner."
+            )
 
         if agent.status != AgentStatus.ACTIVE:
             raise RuntimeError(
@@ -1409,6 +1421,7 @@ class MessagingPipeline:
 
         try:
             conversation.agent_id = agent.id
+
             await self.db.commit()
 
         except Exception:
@@ -1443,6 +1456,10 @@ class MessagingPipeline:
             "as possible."
         )
 
+        # --------------------------------------------------------------------
+        # Store customer-facing plan-limit response.
+        # --------------------------------------------------------------------
+
         await self.conversation_service.add_message(
             conversation,
             role=MessageRole.SYSTEM,
@@ -1450,6 +1467,10 @@ class MessagingPipeline:
         )
 
         await self.db.commit()
+
+        # --------------------------------------------------------------------
+        # Send customer-facing plan-limit response.
+        # --------------------------------------------------------------------
 
         try:
             await adapter.send_text(
@@ -1465,6 +1486,14 @@ class MessagingPipeline:
                 conversation.id,
                 exc_info=True,
             )
+
+        # --------------------------------------------------------------------
+        # Create owner notification once every 24 hours.
+        #
+        # IMPORTANT:
+        # NotificationService currently does not expose
+        # create_notification(), so we create the model directly.
+        # --------------------------------------------------------------------
 
         try:
             since = (
@@ -1489,26 +1518,44 @@ class MessagingPipeline:
                 result.scalars().first()
             )
 
-            if existing_notification is None:
-                notification_service = NotificationService(
-                    self.db
-                )
-
-                await notification_service.create_notification(
-                    owner_id=owner.id,
-                    notification_type=(
-                        NotificationType.PLAN_LIMIT_REACHED
+            if existing_notification is not None:
+                logger.debug(
+                    (
+                        "Plan-limit notification already exists "
+                        "within the last 24 hours: owner=%s"
                     ),
-                    title="Monthly messaging limit reached",
-                    message=(
-                        "Your monthly messaging limit has been reached. "
-                        "Customers can still be handled manually."
-                    ),
+                    owner.id,
                 )
+                return
 
-                await self.db.commit()
+            notification = Notification(
+                owner_id=owner.id,
+                type=NotificationType.PLAN_LIMIT_REACHED,
+                title="Monthly messaging limit reached",
+                message=(
+                    "Your monthly messaging limit has been reached. "
+                    "Customers can still be handled manually."
+                ),
+            )
+
+            self.db.add(
+                notification
+            )
+
+            await self.db.commit()
+
+            logger.info(
+                (
+                    "Plan-limit notification created: "
+                    "owner=%s notification=%s"
+                ),
+                owner.id,
+                notification.id,
+            )
 
         except Exception:
+            await self.db.rollback()
+
             logger.warning(
                 (
                     "Failed to create plan-limit notification "
@@ -1674,7 +1721,7 @@ class MessagingPipeline:
             await self.db.commit()
 
             # ----------------------------------------------------------------
-            # Payment receipt classification
+            # Payment receipt classification.
             #
             # Classification NEVER confirms payment.
             # ----------------------------------------------------------------
@@ -2254,7 +2301,7 @@ Messaging capabilities:
         )
 
         # --------------------------------------------------------------------
-        # Generate with tools when customer exists
+        # Generate with tools when customer exists.
         # --------------------------------------------------------------------
 
         if customer is not None:
