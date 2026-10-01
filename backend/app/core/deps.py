@@ -8,16 +8,20 @@ Authorization:
 - require_role()
 - require_platform_admin()
 
-Billing:
+Subscription:
 - require_active_subscription()
 
 IMPORTANT:
 Authentication and subscription access are intentionally separate.
 
-A user can be authenticated without having an active paid subscription.
-Paid endpoints must explicitly depend on require_active_subscription()
-so an incomplete, canceled, or past-due subscription cannot use paid
-features.
+A user can be authenticated without having an active subscription.
+
+Billing endpoints should continue using get_current_active_user()
+so users with incomplete, canceled, past-due, or missing subscriptions
+can still access billing and complete payment.
+
+Endpoints that actually require an active PersonaAI subscription should
+explicitly depend on require_active_subscription().
 """
 
 import uuid
@@ -28,8 +32,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import JWTError, decode_token
+from app.core.subscription_access import check_subscription_access
 from app.database import get_db
-from app.models.subscription import Subscription, SubscriptionStatus
+from app.models.subscription import SubscriptionStatus
 from app.models.user import User, UserRole
 
 
@@ -70,7 +75,9 @@ async def get_current_user(
         raise credentials_error
 
     result = await db.execute(
-        select(User).where(User.id == parsed_user_id)
+        select(User).where(
+            User.id == parsed_user_id
+        )
     )
 
     user = result.scalar_one_or_none()
@@ -99,35 +106,42 @@ async def require_active_subscription(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Require the user to have an ACTIVE subscription.
+    """Require the user to have a currently usable subscription.
 
-    This dependency is for endpoints that require an active PersonaAI
-    subscription.
-
-    IMPORTANT:
-    An authenticated user is NOT automatically considered subscribed.
+    Subscription access is centralized in
+    app.core.subscription_access.check_subscription_access().
 
     Allowed:
-        SubscriptionStatus.ACTIVE
+        - ACTIVE subscription
+        - subscription period has not expired
+        - associated billing plan still exists and is active
 
     Rejected:
         - no subscription
         - incomplete
         - past_due
         - canceled
+        - expired subscription period
+        - missing/inactive billing plan
 
-    This check happens on the backend, so hiding buttons in the frontend
-    is not sufficient to bypass it.
+    Billing endpoints should NOT use this dependency because users
+    with inactive subscriptions must still be able to access billing
+    and complete payment.
     """
 
-    result = await db.execute(
-        select(Subscription).where(
-            Subscription.owner_id == current_user.id
-        )
+    (
+        allowed,
+        subscription,
+        plan,
+    ) = await check_subscription_access(
+        db,
+        current_user.id,
     )
 
-    subscription = result.scalar_one_or_none()
+    if allowed:
+        return current_user
 
+    # No subscription at all.
     if subscription is None:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -140,37 +154,60 @@ async def require_active_subscription(
             },
         )
 
-    if subscription.status != SubscriptionStatus.ACTIVE:
-        status_messages = {
-            SubscriptionStatus.INCOMPLETE: (
-                "Your payment has not been completed. "
-                "Complete checkout to use this feature."
-            ),
-            SubscriptionStatus.PAST_DUE: (
-                "Your subscription payment is past due. "
-                "Please update your payment method."
-            ),
-            SubscriptionStatus.CANCELED: (
-                "Your subscription has been canceled. "
-                "Choose a plan to continue."
-            ),
-        }
-
-        message = status_messages.get(
-            subscription.status,
-            "An active subscription is required to use this feature.",
-        )
-
+    # Subscription exists but is not active.
+    if subscription.status == SubscriptionStatus.INCOMPLETE:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail={
-                "code": "subscription_inactive",
+                "code": "subscription_incomplete",
                 "status": subscription.status.value,
-                "message": message,
+                "message": (
+                    "Your payment has not been completed. "
+                    "Complete checkout to use this feature."
+                ),
             },
         )
 
-    return current_user
+    if subscription.status == SubscriptionStatus.PAST_DUE:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "code": "subscription_past_due",
+                "status": subscription.status.value,
+                "message": (
+                    "Your subscription payment is past due. "
+                    "Please update your payment method."
+                ),
+            },
+        )
+
+    if subscription.status == SubscriptionStatus.CANCELED:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "code": "subscription_canceled",
+                "status": subscription.status.value,
+                "message": (
+                    "Your subscription has been canceled. "
+                    "Choose a plan to continue."
+                ),
+            },
+        )
+
+    # Covers an ACTIVE subscription whose period has expired,
+    # or an ACTIVE subscription whose plan is missing/inactive.
+    raise HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        detail={
+            "code": "subscription_inactive",
+            "status": subscription.status.value,
+            "message": (
+                "Your subscription is no longer active. "
+                "Please choose a plan or renew your subscription "
+                "to continue."
+            ),
+        },
+    )
 
 
 def require_role(*allowed_roles: UserRole):
