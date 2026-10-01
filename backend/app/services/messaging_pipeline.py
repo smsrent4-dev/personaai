@@ -1481,29 +1481,80 @@ class MessagingPipeline:
                 notification_service = NotificationService(
                     self.db
                 )
+                await notification_service.create(
 
-                await notification_service.create_notification(
                     owner_id=owner.id,
-                    notification_type=(
-                        NotificationType.PLAN_LIMIT_REACHED
-                    ),
+
+                    type_=NotificationType.PLAN_LIMIT_REACHED,
+
                     title="Monthly messaging limit reached",
-                    message=(
+
+                    body=(
+
                         "Your monthly messaging limit has been reached. "
+
                         "Customers can still be handled manually."
+
                     ),
+
+                    context={
+
+                        "conversation_id": str(
+
+                            conversation.id
+
+                        ),
+
+                        "integration_id": str(
+
+                            integration.id
+
+                        ),
+
+                        "plan_id": (
+
+                            str(plan.id)
+
+                            if plan is not None
+
+                            else None
+
+                        ),
+
+                    },
+
                 )
 
                 await self.db.commit()
 
+                logger.info(
+
+                    (
+
+                        "Plan-limit notification created for owner %s"
+
+                    ),
+
+                    owner.id,
+
+                )
+
         except Exception:
+
             logger.warning(
+
                 (
+
                     "Failed to create plan-limit notification "
+
                     "for owner %s"
+
                 ),
+
                 owner.id,
+
                 exc_info=True,
+
             )
 
     # ========================================================================
