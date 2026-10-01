@@ -7,15 +7,16 @@ Flow:
 3. Store inbound message.
 4. Mark message as read / typing where supported.
 5. Get/create customer.
-6. Apply human takeover, auto-reply, business-hours and plan-limit rules.
-7. Process image / voice messages.
-8. Select the appropriate agent.
-9. Retrieve knowledge, memory and product context.
-10. Build the conversation prompt without duplicating the current message.
-11. Generate the AI response.
-12. Store the outgoing message.
-13. Send the text response.
-14. Send a product image ONLY when the customer explicitly requested one.
+6. Apply human takeover and subscription-access rules.
+7. Apply auto-reply, business-hours and plan-limit rules.
+8. Process image / voice messages.
+9. Select the appropriate agent.
+10. Retrieve knowledge, memory and product context.
+11. Build the conversation prompt without duplicating the current message.
+12. Generate the AI response.
+13. Store the outgoing message.
+14. Send the text response.
+15. Send a product image ONLY when the customer explicitly requested one.
 
 Production AI-request rules:
 
@@ -33,6 +34,8 @@ Production AI-request rules:
 - Platform media results are normalized before AI processing.
 - Product-image sending is controlled by application logic.
 - Normal product searches NEVER automatically send product images.
+- AI automation is blocked unless the owner's subscription is ACTIVE.
+- Billing remains accessible even when the subscription is inactive.
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.plan_limits import check_message_limit
+from app.core.subscription_access import check_subscription_access
 from app.models.agent import Agent, AgentStatus
 from app.models.conversation import Conversation
 from app.models.integration import PlatformIntegration
@@ -76,15 +80,6 @@ logger = logging.getLogger(__name__)
 # Production AI limits
 # ============================================================================
 
-# Customer messaging should normally require:
-#
-#   Gemini -> final answer
-#
-# or:
-#
-#   Gemini -> tool call -> Gemini -> final answer
-#
-# Keeping this low prevents long tool loops from multiplying API requests.
 _MAX_TOOL_ITERATIONS = 2
 
 
@@ -119,46 +114,35 @@ _PRODUCT_IMAGE_WORDS = (
 )
 
 _PRODUCT_IMAGE_INTENT_PATTERNS = (
-    # "send/show/share me a picture of..."
     r"\b(?:send|show|see|view|get|share)\b"
     r".{0,60}\b(?:photo|picture|pic|image|images|photos|pictures)\b",
 
-    # "picture/image ... send/show..."
     r"\b(?:photo|picture|pic|image|images|photos|pictures)\b"
     r".{0,60}\b(?:send|show|see|view|get|share)\b",
 
-    # "Can I see the hoodie?"
     r"\bcan\s+i\s+(?:see|view)\s+"
     r"(?:it|that|this|the\s+\w+|your\s+\w+|a\s+\w+|an\s+\w+)\b",
 
-    # "Could I see the hoodie?"
     r"\bcould\s+i\s+(?:see|view)\s+"
     r"(?:it|that|this|the\s+\w+|your\s+\w+|a\s+\w+|an\s+\w+)\b",
 
-    # "Let me see the hoodie."
     r"\b(?:let|allow)\s+me\s+(?:see|view)\s+"
     r"(?:it|that|this|the\s+\w+|your\s+\w+|a\s+\w+|an\s+\w+)\b",
 
-    # "I want to see the hoodie."
     r"\bi\s+(?:want|would\s+like|d['’]like)\s+to\s+(?:see|view)\s+"
     r"(?:it|that|this|the\s+\w+|your\s+\w+|a\s+\w+|an\s+\w+)\b",
 
-    # "What does the hoodie look like?"
     r"\bwhat\s+(?:does|do)\b.{0,70}\blook\s+like\b",
 
-    # "Can you show me the hoodie?"
     r"\bcan\s+you\s+show\s+me\b.{0,60}\b"
     r"(?:the|this|that|your|a|an)\b",
 
-    # "Could you show me the hoodie?"
     r"\bcould\s+you\s+show\s+me\b.{0,60}\b"
     r"(?:the|this|that|your|a|an)\b",
 
-    # Explicit image request.
     r"\bshow\s+me\b.{0,60}\b"
     r"(?:photo|picture|pic|image|images|photos|pictures)\b",
 
-    # "Show me what it looks like."
     r"\bshow\s+me\b.{0,60}\b"
     r"(?:what\s+it\s+looks\s+like|what\s+that\s+looks\s+like)\b",
 )
@@ -430,7 +414,6 @@ def _after_hours_reply(
                     <= close_time
                 )
             else:
-                # Overnight schedule, e.g. 22:00 -> 06:00.
                 is_open = (
                     current_time >= open_time
                     or current_time <= close_time
@@ -467,18 +450,7 @@ def _normalize_downloaded_media(
     media_result: Any,
     default_mime_type: str,
 ) -> tuple[bytes, str]:
-    """Normalize adapter media into `(bytes, mime_type)`.
-
-    Adapters may return:
-
-        bytes
-        bytearray
-        memoryview
-        (bytes, mime_type)
-        [bytes, mime_type]
-        response-like objects with `.content`
-        objects with `.content` and `.mime_type`
-    """
+    """Normalize adapter media into `(bytes, mime_type)`."""
 
     if media_result is None:
         raise ValueError(
@@ -787,7 +759,61 @@ class MessagingPipeline:
                 return
 
             # ----------------------------------------------------------------
-            # 7. Auto-reply setting
+            # 7. Subscription access
+            #
+            # IMPORTANT:
+            #
+            # Webhook messages do not pass through FastAPI dependencies.
+            # Therefore require_active_subscription() cannot protect this
+            # execution path.
+            #
+            # We check the subscription directly here BEFORE:
+            #
+            # - auto reply
+            # - business-hours AI response
+            # - plan-limit processing
+            # - image analysis
+            # - payment-receipt classification
+            # - voice transcription
+            # - product retrieval
+            # - AI routing
+            # - Gemini generation
+            #
+            # Billing remains accessible through normal authenticated
+            # billing endpoints.
+            # ----------------------------------------------------------------
+
+            (
+                subscription_allowed,
+                subscription,
+                subscription_plan,
+            ) = await check_subscription_access(
+                self.db,
+                owner.id,
+            )
+
+            if not subscription_allowed:
+                subscription_status = (
+                    subscription.status.value
+                    if subscription is not None
+                    else "none"
+                )
+
+                logger.info(
+                    (
+                        "Skipping AI automation because subscription "
+                        "is not active: owner=%s conversation=%s "
+                        "status=%s"
+                    ),
+                    owner.id,
+                    conversation.id,
+                    subscription_status,
+                )
+
+                return
+
+            # ----------------------------------------------------------------
+            # 8. Auto-reply setting
             # ----------------------------------------------------------------
 
             if not integration.settings.get(
@@ -804,7 +830,7 @@ class MessagingPipeline:
                 return
 
             # ----------------------------------------------------------------
-            # 8. Business hours
+            # 9. Business hours
             # ----------------------------------------------------------------
 
             after_hours_reply = _after_hours_reply(
@@ -838,7 +864,7 @@ class MessagingPipeline:
                 return
 
             # ----------------------------------------------------------------
-            # 9. Plan limit
+            # 10. Plan limit
             # ----------------------------------------------------------------
 
             limit_reached, plan = (
@@ -859,7 +885,7 @@ class MessagingPipeline:
                 return
 
             # ----------------------------------------------------------------
-            # 10. Process media
+            # 11. Process media
             # ----------------------------------------------------------------
 
             effective_text = incoming.text
@@ -927,7 +953,7 @@ class MessagingPipeline:
                     return
 
             # ----------------------------------------------------------------
-            # 11. Detect explicit product image request
+            # 12. Detect explicit product image request
             # ----------------------------------------------------------------
 
             wants_product_image = (
@@ -947,20 +973,7 @@ class MessagingPipeline:
                 )
 
             # ----------------------------------------------------------------
-            # 12. Select agent
-            #
-            # IMPORTANT:
-            #
-            # We deliberately DO NOT call AI routing for every message.
-            #
-            # Existing conversation assignment:
-            #     conversation.agent_id -> use it directly.
-            #
-            # No assignment + one active agent:
-            #     use that agent directly.
-            #
-            # No assignment + multiple active agents:
-            #     call AI router once and persist the result.
+            # 13. Select agent
             # ----------------------------------------------------------------
 
             agent = None
@@ -1013,7 +1026,7 @@ class MessagingPipeline:
                     agent = None
 
             # ----------------------------------------------------------------
-            # 13. Generate AI response
+            # 14. Generate AI response
             # ----------------------------------------------------------------
 
             if agent is None:
@@ -1087,7 +1100,7 @@ class MessagingPipeline:
                     requested_product = None
 
             # ----------------------------------------------------------------
-            # 14. Store outgoing message
+            # 15. Store outgoing message
             # ----------------------------------------------------------------
 
             await self.conversation_service.add_message(
@@ -1104,7 +1117,7 @@ class MessagingPipeline:
             await self.db.commit()
 
             # ----------------------------------------------------------------
-            # 15. Send text
+            # 16. Send text
             # ----------------------------------------------------------------
 
             try:
@@ -1126,7 +1139,7 @@ class MessagingPipeline:
                 return
 
             # ----------------------------------------------------------------
-            # 16. Send product image only when explicitly requested
+            # 17. Send product image only when explicitly requested
             # ----------------------------------------------------------------
 
             if (
@@ -1238,34 +1251,10 @@ class MessagingPipeline:
         integration: PlatformIntegration,
         message: str | None,
     ) -> Agent:
-        """Select an agent while minimizing unnecessary AI routing.
-
-        Decision tree:
-
-            1. Existing active conversation agent
-                    ↓
-                  use it
-
-            2. No assigned agent + one active agent
-                    ↓
-                  use it
-
-            3. No assigned agent + multiple active agents
-                    ↓
-                  AI route once
-                    ↓
-                  persist assignment
-
-        This is intentionally different from routing every message.
-        Once a conversation has an agent, future messages stay with that
-        agent unless another part of the application explicitly changes
-        `conversation.agent_id`.
-        """
+        """Select an agent while minimizing unnecessary AI routing."""
 
         # --------------------------------------------------------------------
         # 1. Reuse existing active conversation assignment.
-        #
-        # This is the most important API-call reduction.
         # --------------------------------------------------------------------
 
         if conversation.agent_id:
@@ -1433,10 +1422,6 @@ class MessagingPipeline:
                 conversation.id,
                 exc_info=True,
             )
-
-            # The selected agent is still usable for the current request.
-            # We deliberately do not fail the customer's message only
-            # because persistence of the assignment failed.
 
     # ========================================================================
     # Plan limit
@@ -2022,14 +2007,7 @@ class MessagingPipeline:
         owner_id,
         query: str | None,
     ) -> Product | None:
-        """Find the product explicitly requested by the customer.
-
-        The cleaned product query is preferred because phrases such as
-        "send me a picture of..." are not useful product-search terms.
-
-        A product without an image is never silently replaced by another
-        product merely because that other product has an image.
-        """
+        """Find the product explicitly requested by the customer."""
 
         if not query:
             return None
@@ -2108,7 +2086,6 @@ class MessagingPipeline:
                 best_product = local_product
                 best_score = local_score
 
-                # The cleaned query is the preferred query.
                 if search_query == cleaned:
                     break
 
@@ -2185,10 +2162,6 @@ class MessagingPipeline:
 
         # --------------------------------------------------------------------
         # Product retrieval
-        #
-        # IMPORTANT:
-        #
-        # Product search does NOT trigger image sending.
         # --------------------------------------------------------------------
 
         product_results = (
@@ -2282,11 +2255,6 @@ Messaging capabilities:
 
         # --------------------------------------------------------------------
         # Generate with tools when customer exists
-        #
-        # IMPORTANT:
-        #
-        # max_tool_iterations=2 means we prevent an unnecessarily long
-        # Gemini tool loop in the real-time messaging path.
         # --------------------------------------------------------------------
 
         if customer is not None:
